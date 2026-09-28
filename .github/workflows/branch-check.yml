@@ -1,7 +1,7 @@
 name: Branch check
 
 # 分支自检：非 master 分支每次推送、以及往 master 提的 PR，都跑一遍 worker 打包 + 相关单测。
-# 只读、不部署，用来在合并前发现编译/测试错误。
+# 只读、不部署，用来在合并前发现编译/测试错误。失败时把日志末尾自动贴到 PR 评论里。
 #
 # 单测只跑 worker/ 和 utils/amsg* 这两块（主动消息相关）。其余测试（live2d、分享导出等）
 # 依赖浏览器环境，在 CI 的纯 Node 里本来就会报 "navigator is not defined"，跟我们的改动无关。
@@ -14,6 +14,8 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write
+  issues: write
 
 concurrency:
   group: branch-check-${{ github.ref }}
@@ -22,6 +24,13 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      CI: 'true'
+      NO_COLOR: '1'
+      FORCE_COLOR: '0'
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,10 +47,36 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile 2>&1 | tee install.log
 
       - name: Build workers
-        run: pnpm run build:workers
+        run: pnpm run build:workers 2>&1 | tee build.log
 
       - name: Unit tests (amsg only)
-        run: pnpm exec vitest run worker utils/amsg
+        run: pnpm exec vitest run worker utils/amsg 2>&1 | tee test.log
+
+      - name: Report failure to PR
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const tail = (f) => {
+              try {
+                return fs.readFileSync(f, 'utf8').split('\n').slice(-80).join('\n');
+              } catch (e) {
+                return '(没有这份日志：这一步之前就失败了或还没跑到)';
+              }
+            };
+            const body = [
+              '## 自检失败（自动贴出各步日志末尾）',
+              '### install', '```', tail('install.log'), '```',
+              '### build:workers', '```', tail('build.log'), '```',
+              '### tests', '```', tail('test.log'), '```',
+            ].join('\n').slice(0, 60000);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
