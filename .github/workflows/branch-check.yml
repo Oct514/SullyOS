@@ -1,0 +1,44 @@
+name: Branch check
+
+# 分支自检：非 master 分支每次推送、以及往 master 提的 PR，都跑一遍 worker 打包 + 单测。
+# 只读、不部署，用来在合并前发现编译/测试错误。
+
+on:
+  push:
+    branches-ignore: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workers
+        run: pnpm run build:workers
+
+      - name: Unit tests
+        run: pnpm run test:run
