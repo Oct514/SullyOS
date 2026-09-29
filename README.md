@@ -380,3 +380,5 @@ Instant Push（发完消息就能锁屏走人、角色回复好了自己以推�
 **[ 连接建立 // 等待输入 // 数据库停止咕咕叫 ]**
 
 </div>
+
+<!-- oct514 fork: 触发一次 master push，让 GitHub Actions 注册这个 fork 里的工作流 -->
