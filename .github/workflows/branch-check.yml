@@ -1,7 +1,7 @@
 name: Branch check
 
-# 分支自检：非 master 分支每次推送、以及往 master 提的 PR，都跑一遍 worker 打包 + 相关单测。
-# 只读、不部署，用来在合并前发现编译/测试错误。失败时把日志末尾自动贴到 PR 评论里。
+# 分支自检：非 master 分支每次推送、以及往 master 提的 PR，都跑一遍 worker 打包 + 前端类型检查
+# + 相关单测。只读、不部署，用来在合并前发现编译/测试错误。失败时把日志末尾自动贴到 PR 评论里。
 #
 # 单测只跑 worker/、utils/amsg*、utils/lifeWake* 这几块（主动消息 + 定时唤醒相关）。
 # 其余测试（live2d、分享导出等）依赖浏览器环境，在 CI 的纯 Node 里本来就会报
@@ -10,6 +10,11 @@ name: Branch check
 # 排除 amsgStateSync.gaps.test.ts：这是原仓库自带的一个用正则检查源码文本的测试，
 # 在 master 上就已经挂着（updateWorldbooks 的写法和它期望的正则对不上），
 # 跟本分支的改动无关，先跳过避免一直显示假失败。
+#
+# 类型检查（tsc --noEmit）覆盖前端代码（如 context/OSContext.tsx），worker 打包/单测都
+# 覆盖不到这块——它们只碰 worker/ 和 utils/amsg*。手改大文件（github.dev 网页编辑、没有
+# IDE 实时报错）尤其需要这一步兜底，否则语法/类型错误要等真正跑起来才会暴露。
+# noEmit 只检查类型不产出文件，vite 本身用 esbuild 转译、不做类型检查，两者互补。
 
 on:
   push:
@@ -57,6 +62,9 @@ jobs:
       - name: Build workers
         run: pnpm run build:workers 2>&1 | tee build.log
 
+      - name: Typecheck (frontend incl. OSContext.tsx)
+        run: pnpm exec tsc --noEmit 2>&1 | tee typecheck.log
+
       - name: Unit tests (amsg + lifeWake)
         run: pnpm exec vitest run worker utils/amsg utils/lifeWake --exclude '**/amsgStateSync.gaps.test.ts' 2>&1 | tee test.log
 
@@ -77,6 +85,7 @@ jobs:
               '## 自检失败（自动贴出各步日志末尾）',
               '### install', '```', tail('install.log'), '```',
               '### build:workers', '```', tail('build.log'), '```',
+              '### typecheck', '```', tail('typecheck.log'), '```',
               '### tests', '```', tail('test.log'), '```',
             ].join('\n').slice(0, 60000);
             await github.rest.issues.createComment({
