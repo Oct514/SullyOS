@@ -47,6 +47,7 @@ const NovelApp = lazyApp(() => import('../apps/NovelApp'));
 const BankApp = lazyApp(() => import('../apps/BankApp'));
 const XhsStockApp = lazyApp(() => import('../apps/XhsStockApp'));
 const XhsFreeRoamApp = lazyApp(() => import('../apps/XhsFreeRoamApp'));
+const LifeWakeLogApp = lazyApp(() => import('../apps/LifeWakeLogApp'));
 const BrowserApp = lazyApp(() => import('../apps/BrowserApp'));
 const SongwritingApp = lazyApp(() => import('../apps/SongwritingApp'));
 const MusicApp = lazyApp(() => import('../apps/MusicApp'));
@@ -88,7 +89,7 @@ const APP_BY_ID: Partial<Record<AppID, PreloadableLazy>> = {
   [AppID.CheckPhone]: CheckPhone, [AppID.Social]: SocialApp, [AppID.Study]: StudyApp,
   [AppID.FAQ]: FAQApp, [AppID.Game]: GameApp, [AppID.Worldbook]: WorldbookApp,
   [AppID.Novel]: NovelApp, [AppID.Bank]: BankApp, [AppID.XhsStock]: XhsStockApp,
-  [AppID.XhsFreeRoam]: XhsFreeRoamApp, [AppID.Browser]: BrowserApp, [AppID.Songwriting]: SongwritingApp,
+  [AppID.XhsFreeRoam]: XhsFreeRoamApp, [AppID.LifeWakeLog]: LifeWakeLogApp, [AppID.Browser]: BrowserApp, [AppID.Songwriting]: SongwritingApp,
   [AppID.Music]: MusicApp, [AppID.Call]: CallApp, [AppID.VoiceDesigner]: VoiceDesignerApp,
   [AppID.Guidebook]: GuidebookApp, [AppID.LifeSim]: LifeSimApp, [AppID.MemoryPalace]: MemoryPalaceApp,
   [AppID.Handbook]: HandbookApp, [AppID.QQBridge]: QQBridge, [AppID.HotNews]: HotNewsApp,
@@ -121,113 +122,6 @@ import ErrorDialog from './os/ErrorDialog';
 import BootSequence from './os/BootSequence';
 import { setAppPayloadWarmer, shouldUseIdleAppPreload } from './os/appPreload';
 import { isBrowserBackGuardState, makeBrowserBackGuardState } from '../utils/browserBackGuard';
-
-/*
-// Internal Error Boundary Component
-class AppErrorBoundary extends Component<{ children: React.ReactNode, onCloseApp: () => void, resetKey: string }, { hasError: boolean, error: Error | null, copyLabel: string }> {
-    private copyLabelTimer: number | null = null;
-
-    constructor(props: { children: React.ReactNode, onCloseApp: () => void, resetKey: string }) {
-        super(props);
-        this.state = { hasError: false, error: null, copyLabel: '复制报错信息' };
-    }
-
-    static getDerivedStateFromError(error: Error) {
-        return { hasError: true, error };
-    }
-
-    componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-        console.error("App Crash:", error, errorInfo);
-    }
-
-    // Reset error state only when the active app changes.
-    componentDidUpdate(prevProps: { children: React.ReactNode, onCloseApp: () => void, resetKey: string }) {
-        if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
-            this.setState({ hasError: false, error: null, copyLabel: '复制报错信息' });
-        }
-    }
-
-    componentWillUnmount() {
-        if (this.copyLabelTimer) window.clearTimeout(this.copyLabelTimer);
-    }
-
-    private updateCopyLabel = (label: string) => {
-        if (this.copyLabelTimer) window.clearTimeout(this.copyLabelTimer);
-        this.setState({ copyLabel: label });
-        this.copyLabelTimer = window.setTimeout(() => {
-            this.setState({ copyLabel: '复制报错信息' });
-            this.copyLabelTimer = null;
-        }, 1800);
-    };
-
-    private handleCopy = async () => {
-        const errText = this.state.error?.stack || this.state.error?.message || 'Unknown Error';
-
-        try {
-            if (navigator.clipboard?.writeText) {
-                await navigator.clipboard.writeText(errText);
-                this.updateCopyLabel('已复制');
-                return;
-            }
-        } catch {
-            // Fall through to legacy copy path.
-        }
-
-        try {
-            const textarea = document.createElement('textarea');
-            textarea.value = errText;
-            textarea.setAttribute('readonly', 'true');
-            textarea.style.position = 'fixed';
-            textarea.style.opacity = '0';
-            textarea.style.pointerEvents = 'none';
-            document.body.appendChild(textarea);
-            textarea.focus();
-            textarea.select();
-            const copied = document.execCommand('copy');
-            document.body.removeChild(textarea);
-            if (copied) {
-                this.updateCopyLabel('已复制');
-                return;
-            }
-        } catch {
-            // Fall through to prompt fallback.
-        }
-
-        window.prompt('请手动复制报错信息', errText);
-        this.updateCopyLabel('请手动复制');
-    };
-
-    render() {
-        if (this.state.hasError) {
-            return (
-                <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900 text-white p-6 text-center space-y-4">
-                    <img src="https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/1f635.png" alt="error" className="w-10 h-10" />
-                    <h2 className="text-lg font-bold">应用运行错误</h2>
-                    <p className="text-xs text-slate-400 font-mono bg-black/30 p-3 rounded max-w-full overflow-auto max-h-40 select-text break-all whitespace-pre-wrap">
-                        {this.state.error?.message || 'Unknown Error'}
-                    </p>
-                    <button
-                        onClick={() => {
-                            const errText = this.state.error?.message || 'Unknown Error';
-                            navigator.clipboard?.writeText(errText).then(() => {}).catch(() => {});
-                        }}
-                        className="px-4 py-2 bg-slate-700 rounded-full text-xs active:scale-95 transition-transform"
-                    >
-                        复制错误信息
-                    </button>
-                    <button
-                        onClick={() => { this.setState({ hasError: false }); this.props.onCloseApp(); }}
-                        className="px-6 py-3 bg-red-600 rounded-full font-bold text-sm shadow-lg active:scale-95 transition-transform"
-                    >
-                        返回桌面
-                    </button>
-                </div>
-            );
-        }
-        return this.props.children;
-    }
-}
-*/
 
 const DISCLAIMER_KEY = 'sullyos_disclaimer_accepted';
 
@@ -951,6 +845,7 @@ const PhoneShell: React.FC = () => {
       case AppID.Bank: return <BankApp />;
       case AppID.XhsStock: return <XhsStockApp />;
       case AppID.XhsFreeRoam: return <XhsFreeRoamApp />;
+      case AppID.LifeWakeLog: return <LifeWakeLogApp />;
       case AppID.Browser: return <BrowserApp />;
       case AppID.Songwriting: return <SongwritingApp />;
       case AppID.Music: return <MusicApp />;
