@@ -13,6 +13,10 @@
  *
  * 已接入 context/OSContext.tsx：每 WAKE_CHECK_INTERVAL_MS 对每个开了「主动消息2.0」的
  * 角色跑一遍 maybeTriggerLifeWake。
+ *
+ * ⚠️ 下面的时间/概率常数目前是「测试档」（2026-10 调），为了在部署出来的测试站上几分钟
+ * 内就能看到效果，刻意调短/调高了。正式长期使用前应该调回更保守的值（比如 90 分钟冷却 +
+ * 15 分钟检查 + 白天 12% / 夜里 4%），否则角色会醒得过于频繁。
  */
 
 /** 每个角色的唤醒状态，存在 localStorage，key 里带 charId，值只有一个时间戳。 */
@@ -42,18 +46,18 @@ export const markLifeWaked = (charId: string, at: number): void => {
   }
 };
 
-// ─── 唤醒概率 ───
+// ─── 唤醒概率（测试档，见文件头注释） ───
 
-/** 两次唤醒之间最少隔多久，防止判断跑得勤就把角色吵得很勤。 */
-export const MIN_WAKE_INTERVAL_MS = 90 * 60_000; // 90 分钟
+/** 两次唤醒之间最少隔多久，防止判断跑得勤就把角色吵得很勤。测试档：3 分钟（正式值 90 分钟）。 */
+export const MIN_WAKE_INTERVAL_MS = 3 * 60_000;
 
-/** 判断窗口建议值：够久没醒的角色，调用方大概多久检查一次「现在要不要醒」。 */
-export const WAKE_CHECK_INTERVAL_MS = 15 * 60_000; // 15 分钟
+/** 判断窗口建议值：够久没醒的角色，调用方大概多久检查一次「现在要不要醒」。测试档：1 分钟（正式值 15 分钟）。 */
+export const WAKE_CHECK_INTERVAL_MS = 60_000;
 
-/** 白天（本地 6:00-24:00）单次判断的命中概率。 */
-const DAY_WAKE_CHANCE = 0.12;
-/** 夜里（本地 0:00-6:00）单次判断的命中概率，明显调低，别半夜把人吵醒。 */
-const NIGHT_WAKE_CHANCE = 0.04;
+/** 白天（本地 6:00-24:00）单次判断的命中概率。测试档：35%（正式值 12%）。 */
+const DAY_WAKE_CHANCE = 0.35;
+/** 夜里（本地 0:00-6:00）单次判断的命中概率，仍比白天低一截。测试档：15%（正式值 4%）。 */
+const NIGHT_WAKE_CHANCE = 0.15;
 
 const isNightHour = (hour: number): boolean => hour >= 0 && hour < 6;
 
