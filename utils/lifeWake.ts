@@ -6,12 +6,13 @@
  * 或任何 CharacterProfile 之类的应用类型，只认 charId 这个字符串——判断逻辑和排程接口的
  * 具体形状不焊死在一起，以后排程那边怎么改都不会牵连到这儿。
  *
- * v1 范围：只做「要不要现在唤醒」的判断 + 给一句方向提示。唤醒之后走的是已有的主动消息
- * 生成流程（mode='prompted'，同样能用工具），不是另开一条通道；这次唤醒最终会不会真的
- * 发出一条消息，由那条流程自己判断——这里只负责「要不要去问一次」，不负责「问完必须说话」。
+ * v1 范围：只做「要不要现在唤醒」的判断 + 给一句方向提示 + 记一份技术日志（唤醒日志
+ * App 读这份日志）。唤醒之后走的是已有的主动消息生成流程（mode='prompted'，同样能用
+ * 工具），不是另开一条通道；这次唤醒最终会不会真的发出一条消息，由那条流程自己判断——
+ * 这里只负责「要不要去问一次」，不负责「问完必须说话」。
  *
- * 还没接进 App 里跑：这个文件目前只是待接入的判断逻辑 + 单测，真正的定时调用（多久 tick
- * 一次、从哪个组件的哪个角色列表跑）留在下一步一起接，避免这一步就动现有组件。
+ * 已接入 context/OSContext.tsx：每 WAKE_CHECK_INTERVAL_MS 对每个开了「主动消息2.0」的
+ * 角色跑一遍 maybeTriggerLifeWake。
  */
 
 /** 每个角色的唤醒状态，存在 localStorage，key 里带 charId，值只有一个时间戳。 */
@@ -56,8 +57,17 @@ const NIGHT_WAKE_CHANCE = 0.04;
 
 const isNightHour = (hour: number): boolean => hour >= 0 && hour < 6;
 
+/** 是否已经过了「冷却期」，到了可以认真判断一次的时间点（不管概率结果如何）。 */
+export const isWakeDue = (now: Date, lastWakeAt: number): boolean =>
+  now.getTime() - lastWakeAt >= MIN_WAKE_INTERVAL_MS;
+
+const rollHits = (now: Date, roll: number): boolean => {
+  const chance = isNightHour(now.getHours()) ? NIGHT_WAKE_CHANCE : DAY_WAKE_CHANCE;
+  return roll < chance;
+};
+
 /**
- * 这一次判断该不该唤醒。
+ * 这一次判断该不该唤醒（= 过了冷却期 且 概率骰中）。
  *
  * @param now 当前时间
  * @param lastWakeAt 上次唤醒的时间戳（0 = 从没醒过）
@@ -67,11 +77,7 @@ export const shouldWakeNow = (
   now: Date,
   lastWakeAt: number,
   roll: number = Math.random(),
-): boolean => {
-  if (now.getTime() - lastWakeAt < MIN_WAKE_INTERVAL_MS) return false;
-  const chance = isNightHour(now.getHours()) ? NIGHT_WAKE_CHANCE : DAY_WAKE_CHANCE;
-  return roll < chance;
-};
+): boolean => isWakeDue(now, lastWakeAt) && rollHits(now, roll);
 
 // ─── 方向提示 ───
 
@@ -92,11 +98,76 @@ export const LIFE_WAKE_PROMPT_HINT = [
 
 export interface TriggerLifeWakeResult {
   triggered: boolean;
-  reason: 'scheduled' | 'not-due' | 'schedule-failed';
+  reason: 'scheduled' | 'not-due' | 'missed' | 'schedule-failed';
 }
 
+// ─── 唤醒日志（唤醒日志 App 读这份；技术记录，不是角色说了什么） ───
+
+const LOG_KEY = 'lifeWake_log';
+/** 日志条数上限，超出后丢最旧的；纯调试用途，不需要无限堆积。 */
+const LOG_MAX_ENTRIES = 200;
+
+export type LifeWakeLogReason = 'triggered' | 'missed' | 'schedule-failed';
+
+export interface LifeWakeLogEntry {
+  charId: string;
+  /** 本次判断的时间戳（epoch ms）。 */
+  at: number;
+  reason: LifeWakeLogReason;
+}
+
+const isLifeWakeLogReason = (v: unknown): v is LifeWakeLogReason =>
+  v === 'triggered' || v === 'missed' || v === 'schedule-failed';
+
+const isLifeWakeLogEntry = (v: any): v is LifeWakeLogEntry =>
+  !!v && typeof v.charId === 'string' && typeof v.at === 'number' && isLifeWakeLogReason(v.reason);
+
+const readAllLogEntriesRaw = (): LifeWakeLogEntry[] => {
+  try {
+    const raw = localStorage.getItem(LOG_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(isLifeWakeLogEntry) : [];
+  } catch {
+    return [];
+  }
+};
+
+const appendLifeWakeLog = (entry: LifeWakeLogEntry): void => {
+  try {
+    const list = readAllLogEntriesRaw();
+    list.push(entry);
+    const trimmed = list.length > LOG_MAX_ENTRIES ? list.slice(list.length - LOG_MAX_ENTRIES) : list;
+    localStorage.setItem(LOG_KEY, JSON.stringify(trimmed));
+  } catch {
+    /* 日志写不进去就算了，只影响「唤醒日志」App 的展示，不影响判断/触发本身 */
+  }
+};
+
+/** 读取唤醒日志，按时间倒序（最新的在最前）。传 charId 只看某个角色的。 */
+export const readLifeWakeLog = (charId?: string): LifeWakeLogEntry[] => {
+  const all = readAllLogEntriesRaw();
+  const filtered = charId ? all.filter((e) => e.charId === charId) : all;
+  return filtered.slice().sort((a, b) => b.at - a.at);
+};
+
+/** 清空唤醒日志。传 charId 只清那个角色的，不传清全部。 */
+export const clearLifeWakeLog = (charId?: string): void => {
+  try {
+    if (!charId) {
+      localStorage.removeItem(LOG_KEY);
+      return;
+    }
+    const remaining = readAllLogEntriesRaw().filter((e) => e.charId !== charId);
+    localStorage.setItem(LOG_KEY, JSON.stringify(remaining));
+  } catch {
+    /* 忽略：清不掉就留着，不是致命问题 */
+  }
+};
+
 /**
- * 判断 + （命中的话）真正触发一次。
+ * 判断 + （命中的话）真正触发一次；全程往 LifeWakeLog 里记一笔——除了「还在冷却期」
+ * 这种高频、不值得看的情况（15 分钟一次全角色跑，冷却期内每次都记会把日志刷满噪音）。
  *
  * @param scheduleTask 真正去排程/生成的函数，由调用方注入——拿的是当下的角色配置、
  *   用户资料这些，这个文件完全不关心它们的具体类型。
@@ -108,17 +179,26 @@ export const maybeTriggerLifeWake = async (args: {
 }): Promise<TriggerLifeWakeResult> => {
   const now = args.now ?? new Date();
   const { lastWakeAt } = readLifeWakeState(args.charId);
-  if (!shouldWakeNow(now, lastWakeAt)) {
+
+  if (!isWakeDue(now, lastWakeAt)) {
     return { triggered: false, reason: 'not-due' };
   }
+
+  if (!rollHits(now, Math.random())) {
+    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'missed' });
+    return { triggered: false, reason: 'missed' };
+  }
+
   try {
     await args.scheduleTask(LIFE_WAKE_PROMPT_HINT);
   } catch (error) {
     // 排程失败不标记「已唤醒」：下一个判断窗口还会再试一次，别因为一次网络抖动
     // 就把这个角色晾整整一个 MIN_WAKE_INTERVAL_MS。
     console.warn('[lifeWake] 排程失败，下次判断窗口再试', args.charId, error);
+    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'schedule-failed' });
     return { triggered: false, reason: 'schedule-failed' };
   }
   markLifeWaked(args.charId, now.getTime());
+  appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'triggered' });
   return { triggered: true, reason: 'scheduled' };
 };
