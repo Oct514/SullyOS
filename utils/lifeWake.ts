@@ -12,7 +12,9 @@
  * 这里只负责「要不要去问一次」，不负责「问完必须说话」。
  *
  * 已接入 context/OSContext.tsx：每 WAKE_CHECK_INTERVAL_MS 对每个开了「主动消息2.0」的
- * 角色跑一遍 maybeTriggerLifeWake。
+ * 角色跑一遍 maybeTriggerLifeWake；触发成功后会延迟去聊天记录里找角色新发的那条消息，
+ * 摘一段文字回填进日志（见 attachLifeWakeExcerpt）——这一步因为要读聊天数据库，不放在
+ * 这个纯函数文件里做，由 OSContext 调用 DB 读完后再调 attachLifeWakeExcerpt 写回。
  *
  * ⚠️ 下面的时间/概率常数目前是「测试档」（2026-10 调），为了在部署出来的测试站上几分钟
  * 内就能看到效果，刻意调短/调高了。正式长期使用前应该调回更保守的值（比如 90 分钟冷却 +
@@ -105,7 +107,7 @@ export interface TriggerLifeWakeResult {
   reason: 'scheduled' | 'not-due' | 'missed' | 'schedule-failed';
 }
 
-// ─── 唤醒日志（唤醒日志 App 读这份；技术记录，不是角色说了什么） ───
+// ─── 唤醒日志（唤醒日志 App 读这份；技术记录 + 事后补上的内容摘要） ───
 
 const LOG_KEY = 'lifeWake_log';
 /** 日志条数上限，超出后丢最旧的；纯调试用途，不需要无限堆积。 */
@@ -118,13 +120,20 @@ export interface LifeWakeLogEntry {
   /** 本次判断的时间戳（epoch ms）。 */
   at: number;
   reason: LifeWakeLogReason;
+  /**
+   * 触发成功后，角色实际说了什么的摘录（由调用方事后读聊天记录回填，见
+   * attachLifeWakeExcerpt）。写日志这一刻还不知道角色会不会说话/说什么——
+   * 排程只是把生成任务扔出去，真正生成是异步的——所以这个字段一开始总是空的。
+   */
+  excerpt?: string;
 }
 
 const isLifeWakeLogReason = (v: unknown): v is LifeWakeLogReason =>
   v === 'triggered' || v === 'missed' || v === 'schedule-failed';
 
 const isLifeWakeLogEntry = (v: any): v is LifeWakeLogEntry =>
-  !!v && typeof v.charId === 'string' && typeof v.at === 'number' && isLifeWakeLogReason(v.reason);
+  !!v && typeof v.charId === 'string' && typeof v.at === 'number' && isLifeWakeLogReason(v.reason)
+  && (v.excerpt === undefined || typeof v.excerpt === 'string');
 
 const readAllLogEntriesRaw = (): LifeWakeLogEntry[] => {
   try {
@@ -137,15 +146,19 @@ const readAllLogEntriesRaw = (): LifeWakeLogEntry[] => {
   }
 };
 
-const appendLifeWakeLog = (entry: LifeWakeLogEntry): void => {
+const writeAllLogEntriesRaw = (list: LifeWakeLogEntry[]): void => {
   try {
-    const list = readAllLogEntriesRaw();
-    list.push(entry);
-    const trimmed = list.length > LOG_MAX_ENTRIES ? list.slice(list.length - LOG_MAX_ENTRIES) : list;
-    localStorage.setItem(LOG_KEY, JSON.stringify(trimmed));
+    localStorage.setItem(LOG_KEY, JSON.stringify(list));
   } catch {
-    /* 日志写不进去就算了，只影响「唤醒日志」App 的展示，不影响判断/触发本身 */
+    /* 写不进去就算了，只影响「唤醒日志」App 的展示 */
   }
+};
+
+const appendLifeWakeLog = (entry: LifeWakeLogEntry): void => {
+  const list = readAllLogEntriesRaw();
+  list.push(entry);
+  const trimmed = list.length > LOG_MAX_ENTRIES ? list.slice(list.length - LOG_MAX_ENTRIES) : list;
+  writeAllLogEntriesRaw(trimmed);
 };
 
 /** 读取唤醒日志，按时间倒序（最新的在最前）。传 charId 只看某个角色的。 */
@@ -157,16 +170,30 @@ export const readLifeWakeLog = (charId?: string): LifeWakeLogEntry[] => {
 
 /** 清空唤醒日志。传 charId 只清那个角色的，不传清全部。 */
 export const clearLifeWakeLog = (charId?: string): void => {
-  try {
-    if (!charId) {
+  if (!charId) {
+    try {
       localStorage.removeItem(LOG_KEY);
-      return;
+    } catch {
+      /* 忽略 */
     }
-    const remaining = readAllLogEntriesRaw().filter((e) => e.charId !== charId);
-    localStorage.setItem(LOG_KEY, JSON.stringify(remaining));
-  } catch {
-    /* 忽略：清不掉就留着，不是致命问题 */
+    return;
   }
+  const remaining = readAllLogEntriesRaw().filter((e) => e.charId !== charId);
+  writeAllLogEntriesRaw(remaining);
+};
+
+/**
+ * 给一条已有的日志条目（按 charId + at 定位，这俩合起来就是写日志时的主键）回填内容摘录。
+ * 调用方（OSContext）在触发成功后延迟一段时间，去聊天记录里找角色新发的消息，截一段文字
+ * 传进来；这个文件本身不读聊天数据库，保持跟具体消息结构解耦。找不到对应条目就什么也不做
+ * （比如日志已经被用户清空了）。
+ */
+export const attachLifeWakeExcerpt = (charId: string, at: number, excerpt: string): void => {
+  const list = readAllLogEntriesRaw();
+  const idx = list.findIndex((e) => e.charId === charId && e.at === at);
+  if (idx === -1) return;
+  list[idx] = { ...list[idx], excerpt };
+  writeAllLogEntriesRaw(list);
 };
 
 /**
