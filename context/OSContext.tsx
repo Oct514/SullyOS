@@ -68,7 +68,7 @@ import {
 } from '../utils/memoryPalace/autoArchive';
 import { ActiveMsgClient } from '../utils/activeMsgClient';
 import { resolveCharTimeZone, nowInTimeZone } from '../utils/timezone';
-import { maybeTriggerLifeWake, WAKE_CHECK_INTERVAL_MS } from '../utils/lifeWake';
+import { maybeTriggerLifeWake, attachLifeWakeExcerpt, WAKE_CHECK_INTERVAL_MS } from '../utils/lifeWake';
 import { ActiveMsgStore, backupHasBackendConnection, exportAmsg2GlobalConfig } from '../utils/activeMsgStore';
 import { charMayHaveCloudState, purgeCharCloudState, purgeCloudCharById } from '../utils/amsg2CharCleanup';
 import { parseCharCredId } from '../utils/amsgLlmCredentials';
@@ -2250,9 +2250,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               if (activeAppRef.current === AppID.Call && activeCharIdScheduleRef.current === char.id) continue;
               if (suspendedCallRef.current?.charId === char.id) continue;
 
-              try {
-                  await maybeTriggerLifeWake({
+                        try {
+                  const checkNow = new Date();
+                  const result = await maybeTriggerLifeWake({
                       charId: char.id,
+                      now: checkNow,
                       scheduleTask: async (promptHint) => {
                           const charTz = resolveCharTimeZone(char);
                           // 裸墙钟字符串，按角色时区写：跟工具桥排程用的是同一份格式
@@ -2278,7 +2280,41 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                           });
                       },
                   });
+
+                  // 触发成功后，排程只是把生成任务扔出去，角色实际做了什么是异步产生的——
+                  // 而且不一定是发消息：也可能是调用工具/上网查东西，落下来的是别的消息类型
+                  // （比如网页卡片），不是普通文字。延迟几分钟后去聊天记录里找角色这之后
+                  // 新发的第一条消息（不限类型），按类型区分摘要文字；找不到任何新消息
+                  // （真的什么都没做/没落下痕迹）才保持日志原样不补。
+                  if (result.triggered) {
+                      const triggeredAt = checkNow.getTime();
+                      const charIdForLookup = char.id;
+                      setTimeout(() => {
+                          void (async () => {
+                              try {
+                                  const msgs = await DB.getMessagesByCharId(charIdForLookup);
+                                  const found = msgs
+                                      .filter((m) => m.role === 'assistant' && m.timestamp > triggeredAt)
+                                      .sort((a, b) => a.timestamp - b.timestamp)[0];
+                                  if (found) {
+                                      let excerpt: string;
+                                      if (found.type === 'text' && typeof found.content === 'string' && found.content.trim()) {
+                                          excerpt = found.content.length > 60 ? `${found.content.slice(0, 60)}…` : found.content;
+                                      } else {
+                                          // 非文字类型（工具调用产出的卡片等）：不猜内容，只标明"做了点什么、是哪类"，
+                                          // 具体细节用户自己去聊天记录里看对应的卡片。
+                                          excerpt = `（做了点什么——消息类型：${found.type}，不是普通文字，去聊天记录里看详情）`;
+                                      }
+                                      attachLifeWakeExcerpt(charIdForLookup, triggeredAt, excerpt);
+                                  }
+                              } catch (e) {
+                                  console.warn('[LifeWake] 补充日志摘要失败', charIdForLookup, e);
+                              }
+                          })();
+                      }, 3 * 60_000);
+                  }
               } catch (e) {
+                  // 单个角色判断/排程出错不该打断其余角色这一轮的检查。
                   console.warn('[LifeWake] 判断/排程失败', char.id, e);
               }
           }
