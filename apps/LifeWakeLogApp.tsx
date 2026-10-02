@@ -39,6 +39,10 @@ const LifeWakeLogApp: React.FC = () => {
 
   useEffect(() => {
     reload();
+    // 内容摘要是触发几分钟后才异步回填的（见 OSContext 的 attachLifeWakeExcerpt 调用），
+    // 日志面板开着的这段时间里定时刷新一次，免得用户得手动关了再开才能看到摘要补上。
+    const timer = setInterval(reload, 20_000);
+    return () => clearInterval(timer);
   }, [reload]);
 
   const nameFor = (charId: string) => characters.find((c) => c.id === charId)?.name || '（角色已删除）';
@@ -82,15 +86,27 @@ const LifeWakeLogApp: React.FC = () => {
           entries.map((e, i) => (
             <div
               key={`${e.charId}-${e.at}-${i}`}
-              className="bg-white rounded-2xl border border-slate-100 p-3 flex items-center justify-between shadow-sm"
+              className="bg-white rounded-2xl border border-slate-100 p-3 shadow-sm"
             >
-              <div className="min-w-0">
-                <p className="text-xs font-bold text-slate-700 truncate">{nameFor(e.charId)}</p>
-                <span className={`inline-block mt-1 text-[10px] px-2 py-0.5 rounded-full font-medium ${REASON_STYLE[e.reason]}`}>
-                  {REASON_LABEL[e.reason]}
-                </span>
+              <div className="flex items-center justify-between">
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-slate-700 truncate">{nameFor(e.charId)}</p>
+                  <span className={`inline-block mt-1 text-[10px] px-2 py-0.5 rounded-full font-medium ${REASON_STYLE[e.reason]}`}>
+                    {REASON_LABEL[e.reason]}
+                  </span>
+                </div>
+                <span className="text-[10px] text-slate-300 shrink-0 ml-2">{formatTime(e.at)}</span>
               </div>
-              <span className="text-[10px] text-slate-300 shrink-0 ml-2">{formatTime(e.at)}</span>
+              {e.excerpt && (
+                <p className="mt-2 text-[11px] text-slate-500 leading-snug border-t border-slate-50 pt-2">
+                  "{e.excerpt}"
+                </p>
+              )}
+              {e.reason === 'triggered' && !e.excerpt && (
+                <p className="mt-2 text-[10px] text-slate-300 leading-snug border-t border-slate-50 pt-2">
+                  还没取到内容（可能还在生成，或者这次选择了沉默）
+                </p>
+              )}
             </div>
           ))
         )}
