@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { useOS } from '../context/OSContext';
 import { readLifeWakeLog, clearLifeWakeLog, type LifeWakeLogEntry } from '../utils/lifeWake';
+import type { DriveKey } from '../utils/desireSystem';
 
 const REASON_LABEL: Record<LifeWakeLogEntry['reason'], string> = {
   triggered: '触发了自由活动',
@@ -14,6 +15,18 @@ const REASON_STYLE: Record<LifeWakeLogEntry['reason'], string> = {
   'schedule-failed': 'text-red-500 bg-red-50',
 };
 
+/** 驱动维度的中文名，日志里按这个显示，比看英文 key 直观。 */
+const DRIVE_LABEL: Record<DriveKey, string> = {
+  attachment: '想念',
+  curiosity: '好奇',
+  reflection: '沉淀',
+  duty: '挂念',
+  social: '社交',
+  fatigue: '疲惫',
+  libido: '亲近',
+  stress: '压力',
+};
+
 const formatTime = (ts: number): string => {
   const d = new Date(ts);
   const now = new Date();
@@ -21,6 +34,11 @@ const formatTime = (ts: number): string => {
   const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   const isToday = d.toDateString() === now.toDateString();
   return isToday ? time : `${d.getMonth() + 1}/${d.getDate()} ${time}`;
+};
+
+const formatScore = (score?: number): string => {
+  if (typeof score !== 'number') return '';
+  return score.toFixed(2);
 };
 
 const BackIcon: React.FC = () => (
@@ -78,8 +96,8 @@ const LifeWakeLogApp: React.FC = () => {
             <div className="text-4xl">🌙</div>
             <p className="text-sm text-slate-500 font-bold">还没有唤醒记录</p>
             <p className="text-[11px] text-slate-400 leading-relaxed max-w-[240px]">
-              开着某个已开启"主动消息2.0"的角色的聊天页面一段时间，这里会记录每次后台判断
-              "要不要让 ta 自由活动"的结果，包括判断过但没有触发的次数。
+              开着某个已开启"主动消息2.0"的角色的聊天页面一段时间，这里会记录每次欲望状态机
+              判断"要不要让 ta 自由活动"的结果，包括判断过但分数还没攒够门槛的次数。
             </p>
           </div>
         ) : (
@@ -91,9 +109,16 @@ const LifeWakeLogApp: React.FC = () => {
               <div className="flex items-center justify-between">
                 <div className="min-w-0">
                   <p className="text-xs font-bold text-slate-700 truncate">{nameFor(e.charId)}</p>
-                  <span className={`inline-block mt-1 text-[10px] px-2 py-0.5 rounded-full font-medium ${REASON_STYLE[e.reason]}`}>
-                    {REASON_LABEL[e.reason]}
-                  </span>
+                  <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                    <span className={`inline-block text-[10px] px-2 py-0.5 rounded-full font-medium ${REASON_STYLE[e.reason]}`}>
+                      {REASON_LABEL[e.reason]}
+                    </span>
+                    {e.driveKey && (
+                      <span className="inline-block text-[10px] px-2 py-0.5 rounded-full font-medium text-indigo-500 bg-indigo-50">
+                        {DRIVE_LABEL[e.driveKey]} {formatScore(e.score)}
+                      </span>
+                    )}
+                  </div>
                 </div>
                 <span className="text-[10px] text-slate-300 shrink-0 ml-2">{formatTime(e.at)}</span>
               </div>
