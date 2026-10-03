@@ -56,10 +56,14 @@ export const MIN_WAKE_INTERVAL_MS = 3 * 60_000;
 /** 判断窗口建议值：够久没醒的角色，调用方大概多久检查一次「现在要不要醒」。测试档：1 分钟（正式值 15 分钟）。 */
 export const WAKE_CHECK_INTERVAL_MS = 60_000;
 
-/** 白天（本地 6:00-24:00）单次判断的命中概率。测试档：35%（正式值 12%）。 */
-const DAY_WAKE_CHANCE = 0.35;
+/**
+ * 白天（本地 6:00-24:00）单次判断的命中概率。测试档：35%（正式值 12%）。
+ * 导出是为了让单测能按当前实际值算中间值，不用在测试里写死一个跟这两个常数脱钩的骰子数——
+ * 之前就是因为测试写死了 0.06 这个数，这两个常数从正式档改成测试档之后它才忽然跟着炸了。
+ */
+export const DAY_WAKE_CHANCE = 0.35;
 /** 夜里（本地 0:00-6:00）单次判断的命中概率，仍比白天低一截。测试档：15%（正式值 4%）。 */
-const NIGHT_WAKE_CHANCE = 0.15;
+export const NIGHT_WAKE_CHANCE = 0.15;
 
 const isNightHour = (hour: number): boolean => hour >= 0 && hour < 6;
 
