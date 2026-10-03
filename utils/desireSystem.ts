@@ -15,6 +15,12 @@
  * - satisfy() 的乘性回落天然起到了「冷却」的作用：触发后相关维度被打下去，要再涨回阈值
  *   需要时间，所以不再需要像之前那版一样单独维护一个「两次唤醒最少间隔 90 分钟」的常数；
  *   lifeWake.ts 里留的那个极短 debounce 只是防止同一拍内重复触发的安全阀，不承担节奏控制。
+ * - 【2026-10 新增】7 个需求维度原本所有角色共用同一套上升速度——这会导致不管人设写什么，
+ *   「好奇」因为速度定得最快，几乎总是第一个冲线，显不出角色差异。现在加了一层基于人设
+ *   文本的关键词匹配（computePersonaDriveWeights），给每个维度算一个倍率，让「人设里写了
+ *   粘人」的角色真的更容易因为「想念」触发，而不是所有角色表现一致。这是关键词规则，不是
+ *   LLM 语义理解——人设没写出典型关键词就匹配不到，判断比较死板，先用这个免费方案把链路
+ *   跑通，以后想要更准可以换成调一次 LLM 分析人设的版本。
  */
 
 export const DRIVE_KEYS = ['attachment', 'curiosity', 'reflection', 'duty', 'social', 'fatigue', 'libido', 'stress'] as const;
@@ -57,7 +63,7 @@ export const HINT_FOR_DRIVE: Record<DriveKey, string> = {
 
 // ─── 驱动条随时间变化（一拍 = lifeWake 的一次检查） ───
 
-/** 7 个「需求」维度每拍的上升速度；fatigue 是反向的，不在这张表里，见下面单独处理。 */
+/** 7 个「需求」维度每拍的基础上升速度（人设权重=1 时的速度）；fatigue 是反向的，不在这张表里。 */
 const RISE_PER_TICK: Record<NonFatigueDriveKey, number> = {
   attachment: 0.025,
   curiosity: 0.03,
@@ -83,18 +89,69 @@ const FATIGUE_RELIEF_ON_GATED_REST = 0.1;
 /** fatigue 到这个值，强制归为「歇着」，不管别的维度分数多高——这是闸，不是跟别人抢分的维度。 */
 export const FATIGUE_REST_GATE = 0.72;
 
-/** 按一拍推进驱动条：7 个需求维度照各自速度涨，fatigue 闲置时恢复。 */
-export const easeDrive = (drive: DriveState, now: Date): DriveState => {
+export type DriveWeights = Record<NonFatigueDriveKey, number>;
+
+const DEFAULT_WEIGHTS: DriveWeights = {
+  attachment: 1, curiosity: 1, reflection: 1, duty: 1, social: 1, libido: 1, stress: 1,
+};
+
+/**
+ * 按一拍推进驱动条：7 个需求维度照各自速度（乘上人设权重）涨，fatigue 闲置时恢复。
+ * weights 不传就是所有维度权重=1（跟人设无关的默认行为，向后兼容）。
+ */
+export const easeDrive = (drive: DriveState, now: Date, weights: DriveWeights = DEFAULT_WEIGHTS): DriveState => {
   const mult = isNightHour(now.getHours()) ? NIGHT_RISE_MULTIPLIER : 1;
   const next: DriveState = { ...drive };
   for (const k of DRIVE_KEYS) {
     if (k === 'fatigue') {
       next.fatigue = clamp01(drive.fatigue - FATIGUE_RECOVER_PER_TICK);
     } else {
-      next[k] = clamp01(drive[k] + RISE_PER_TICK[k] * mult);
+      next[k] = clamp01(drive[k] + RISE_PER_TICK[k] * (weights[k] ?? 1) * mult);
     }
   }
   return next;
+};
+
+// ─── 人设文本 → 每个维度的权重（关键词匹配，免费、纯本地计算，不调 LLM） ───
+
+/**
+ * 每个维度对应的典型人设关键词。人设文本（描述 + 系统提示词等）里命中几个，这个维度的
+ * 上升速度就按命中数放大，命中越多倍率越高（封顶），完全没命中的维度保持倍率 1（原速）。
+ * 这是规则匹配，不是语义理解——人设写"离不开你"这种没用到关键词的说法就匹配不到，
+ * 想要更准确得换成调一次 LLM 分析人设的版本（见文件头说明）。
+ */
+const PERSONA_KEYWORDS: Record<NonFatigueDriveKey, string[]> = {
+  attachment: ['粘人', '黏人', '依赖', '舍不得', '离不开', '依恋', '恋人', '想念', '黏着', '粘着'],
+  curiosity: ['好奇', '探索', '求知', '冒险', '爱问', '新鲜感', '爱学习', '爱钻研', '打破砂锅'],
+  reflection: ['内向', '敏感', '细腻', '多愁善感', '文艺', '安静', '喜欢思考', '感性', '内敛', '深沉'],
+  duty: ['责任感', '认真', '靠谱', '一丝不苟', '守时', '尽职', '自律', '原则', '一本正经'],
+  social: ['外向', '爱热闹', '社牛', '朋友多', '活泼', '开朗', '喜欢聚会', '合群', '健谈'],
+  libido: ['撒娇', '调皮', '暧昧', '亲密', '粘腻', '占有欲', '吃醋'],
+  stress: ['焦虑', '压力大', '紧绷', '完美主义', '容易紧张', '神经质', '易崩溃'],
+};
+
+/** 每命中一个关键词，权重 +0.4；最多封顶到 2.6（命中 4 个以上就不再继续放大）。 */
+const PER_KEYWORD_WEIGHT = 0.4;
+const MAX_WEIGHT = 2.6;
+
+/**
+ * 读人设文本，算出 7 个需求维度各自的权重倍率。没有匹配到任何关键词的文本（比如空字符串）
+ * 会返回全 1（等同于不区分人设的旧行为），不会让角色"什么欲望都没有"。
+ */
+export const computePersonaDriveWeights = (personaText: string): DriveWeights => {
+  const text = (personaText || '').toLowerCase();
+  const weights = { ...DEFAULT_WEIGHTS };
+  if (!text) return weights;
+  for (const key of Object.keys(PERSONA_KEYWORDS) as NonFatigueDriveKey[]) {
+    let hits = 0;
+    for (const kw of PERSONA_KEYWORDS[key]) {
+      if (text.includes(kw.toLowerCase())) hits += 1;
+    }
+    if (hits > 0) {
+      weights[key] = Math.min(MAX_WEIGHT, 1 + hits * PER_KEYWORD_WEIGHT);
+    }
+  }
+  return weights;
 };
 
 // ─── 念头池（闪念 flit ↔ 执念 fixation） ───
@@ -319,12 +376,17 @@ export interface DesireTickResult {
 }
 
 /**
- * 推进这个角色的欲望状态机一拍：驱动条随时间涨、念头池衰减/反哺，必要时自动冒出一条新念头，
- * 最后算出此刻最该发作的维度。纯函数计算 + 读写 localStorage，不碰任何聊天/排程相关的东西，
- * 调用方（lifeWake.ts）只管读这里返回的 intent 决定要不要去问一次、给哪种方向提示。
+ * 推进这个角色的欲望状态机一拍：驱动条随时间涨（按人设关键词权重调整各维度速度）、念头池
+ * 衰减/反哺，必要时自动冒出一条新念头，最后算出此刻最该发作的维度。纯函数计算 + 读写
+ * localStorage，不碰任何聊天/排程相关的东西，调用方（lifeWake.ts）只管读这里返回的 intent
+ * 决定要不要去问一次、给哪种方向提示。
+ *
+ * @param personaText 角色的人设文本（描述 + 系统提示词等拼起来），用来算每个维度的权重；
+ *   不传或空字符串就是旧行为（所有维度权重=1）。
  */
-export const tickDesire = (charId: string, now: Date): DesireTickResult => {
-  const drive = easeDrive(readDriveState(charId), now);
+export const tickDesire = (charId: string, now: Date, personaText = ''): DesireTickResult => {
+  const weights = computePersonaDriveWeights(personaText);
+  const drive = easeDrive(readDriveState(charId), now, weights);
   const ticked = tickThoughts(readThoughts(charId));
   let thoughts = ticked.thoughts;
   for (const [k, v] of Object.entries(ticked.feedback)) {
