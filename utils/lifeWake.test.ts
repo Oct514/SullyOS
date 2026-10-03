@@ -7,6 +7,8 @@ import {
   readLifeWakeLog,
   clearLifeWakeLog,
   MIN_WAKE_INTERVAL_MS,
+  DAY_WAKE_CHANCE,
+  NIGHT_WAKE_CHANCE,
   LIFE_WAKE_PROMPT_HINT,
 } from './lifeWake';
 
@@ -39,7 +41,10 @@ describe('shouldWakeNow', () => {
 
   it('夜里同样的骰子结果，命中概率应该比白天低（同一个骰子值白天过、夜里不过）', () => {
     const lastWakeAt = 0;
-    const roll = 0.06; // 落在 [NIGHT_CHANCE, DAY_CHANCE) 之间
+    // 取两个概率的中间值：不管这两个常数本身是测试档还是正式档，中间值
+    // 永远落在「白天能中、夜里不能中」的区间，不会像之前写死 0.06 那样
+    // 一改概率常数就直接炸。
+    const roll = (NIGHT_WAKE_CHANCE + DAY_WAKE_CHANCE) / 2;
     expect(shouldWakeNow(dayNoon(), lastWakeAt, roll)).toBe(true);
     expect(shouldWakeNow(nightThreeAm(), lastWakeAt, roll)).toBe(false);
   });
