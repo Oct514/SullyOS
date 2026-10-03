@@ -1,58 +1,33 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
-  shouldWakeNow,
   maybeTriggerLifeWake,
   readLifeWakeState,
   markLifeWaked,
   readLifeWakeLog,
   clearLifeWakeLog,
+  attachLifeWakeExcerpt,
   MIN_WAKE_INTERVAL_MS,
-  DAY_WAKE_CHANCE,
-  NIGHT_WAKE_CHANCE,
-  LIFE_WAKE_PROMPT_HINT,
 } from './lifeWake';
+import {
+  writeDriveState,
+  readDriveState,
+  FATIGUE_REST_GATE,
+  WAKE_SCORE_THRESHOLD,
+  type DriveState,
+} from './desireSystem';
 
-const dayNoon = (day = 15) => new Date(2026, 5, day, 12, 0, 0); // 白天，非边界
-const nightThreeAm = (day = 15) => new Date(2026, 5, day, 3, 0, 0); // 夜里
+const ZERO: DriveState = {
+  attachment: 0, curiosity: 0, reflection: 0, duty: 0, social: 0, fatigue: 0, libido: 0, stress: 0,
+};
+
+const dayNoon = (day = 15) => new Date(2026, 5, day, 12, 0, 0);
 
 beforeEach(() => {
   localStorage.clear();
   vi.restoreAllMocks();
-});
-
-describe('shouldWakeNow', () => {
-  it('距上次唤醒不到最短间隔时，无论概率骰到多少都不醒', () => {
-    const now = dayNoon();
-    const lastWakeAt = now.getTime() - (MIN_WAKE_INTERVAL_MS - 1000);
-    expect(shouldWakeNow(now, lastWakeAt, 0)).toBe(false);
-  });
-
-  it('过了最短间隔、骰子够小（白天）时会醒', () => {
-    const now = dayNoon();
-    const lastWakeAt = now.getTime() - MIN_WAKE_INTERVAL_MS - 1000;
-    expect(shouldWakeNow(now, lastWakeAt, 0.01)).toBe(true);
-  });
-
-  it('过了最短间隔但骰子偏大时不醒', () => {
-    const now = dayNoon();
-    const lastWakeAt = now.getTime() - MIN_WAKE_INTERVAL_MS - 1000;
-    expect(shouldWakeNow(now, lastWakeAt, 0.99)).toBe(false);
-  });
-
-  it('夜里同样的骰子结果，命中概率应该比白天低（同一个骰子值白天过、夜里不过）', () => {
-    const lastWakeAt = 0;
-    // 取两个概率的中间值：不管这两个常数本身是测试档还是正式档，中间值
-    // 永远落在「白天能中、夜里不能中」的区间，不会像之前写死 0.06 那样
-    // 一改概率常数就直接炸。
-    const roll = (NIGHT_WAKE_CHANCE + DAY_WAKE_CHANCE) / 2;
-    expect(shouldWakeNow(dayNoon(), lastWakeAt, roll)).toBe(true);
-    expect(shouldWakeNow(nightThreeAm(), lastWakeAt, roll)).toBe(false);
-  });
-
-  it('从没醒过（lastWakeAt=0）时，只要过了最短间隔就按正常概率判断', () => {
-    const farFuture = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 60_000);
-    expect(shouldWakeNow(farFuture, 0, 0.01)).toBe(true);
-  });
+  // 压掉欲望状态机 autofeed 那一小撮随机性，让这个文件的测试只关心
+  // "分数够不够门槛" 这条主线，不被念头池的随机冒头干扰。
+  vi.spyOn(Math, 'random').mockReturnValue(0.99);
 });
 
 describe('readLifeWakeState / markLifeWaked', () => {
@@ -79,9 +54,9 @@ describe('readLifeWakeState / markLifeWaked', () => {
 });
 
 describe('maybeTriggerLifeWake', () => {
-  it('还在冷却期内时不会调用 scheduleTask、不写状态、也不记日志', async () => {
+  it('还在安全阀期内时：不推进状态机判断、不调用 scheduleTask、不记日志', async () => {
     const now = dayNoon();
-    markLifeWaked('char-a', now.getTime()); // 刚醒过
+    markLifeWaked('char-a', now.getTime());
     const scheduleTask = vi.fn().mockResolvedValue(undefined);
     const result = await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
     expect(result).toEqual({ triggered: false, reason: 'not-due' });
@@ -89,46 +64,90 @@ describe('maybeTriggerLifeWake', () => {
     expect(readLifeWakeLog('char-a')).toEqual([]);
   });
 
-  it('过了冷却期但骰子没中：不调用 scheduleTask、不标记已唤醒，但记一条 missed 日志', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0.99); // 确保不中
-    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 60_000);
+  it('过了安全阀，但驱动分数还没攒够门槛（全新角色从 0 开始）：不触发，记一条 missed 日志', async () => {
+    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000);
     const scheduleTask = vi.fn().mockResolvedValue(undefined);
     const result = await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
-    expect(result).toEqual({ triggered: false, reason: 'missed' });
+    expect(result.triggered).toBe(false);
+    expect(result.reason).toBe('missed');
+    expect(result.score).toBeLessThan(WAKE_SCORE_THRESHOLD);
     expect(scheduleTask).not.toHaveBeenCalled();
-    expect(readLifeWakeState('char-a').lastWakeAt).toBe(0);
-    expect(readLifeWakeLog('char-a')).toEqual([{ charId: 'char-a', at: now.getTime(), reason: 'missed' }]);
+    const log = readLifeWakeLog('char-a');
+    expect(log).toHaveLength(1);
+    expect(log[0].reason).toBe('missed');
+    expect(log[0].driveKey).toBeDefined();
   });
 
-  it('scheduleTask 成功时标记为已触发、把 lastWakeAt 更新为本次时间，并记一条 triggered 日志', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0.001); // 确保命中
-    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 60_000);
+  it('某个维度分数够门槛时：用对应维度的方向提示触发排程，成功后标记已唤醒、该维度回落', async () => {
+    writeDriveState('char-a', { ...ZERO, social: 0.9 });
+    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000);
     const scheduleTask = vi.fn().mockResolvedValue(undefined);
     const result = await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
-    expect(result).toEqual({ triggered: true, reason: 'scheduled' });
-    expect(scheduleTask).toHaveBeenCalledWith(LIFE_WAKE_PROMPT_HINT);
+    expect(result.triggered).toBe(true);
+    expect(result.driveKey).toBe('social');
+    expect(scheduleTask).toHaveBeenCalledTimes(1);
+    const [hint] = scheduleTask.mock.calls[0];
+    expect(typeof hint).toBe('string');
+    expect(hint.length).toBeGreaterThan(0);
     expect(readLifeWakeState('char-a').lastWakeAt).toBe(now.getTime());
-    expect(readLifeWakeLog('char-a')).toEqual([{ charId: 'char-a', at: now.getTime(), reason: 'triggered' }]);
+    expect(readDriveState('char-a').social).toBeLessThan(0.9); // satisfy 回落了
+    const log = readLifeWakeLog('char-a');
+    expect(log[0].reason).toBe('triggered');
+    expect(log[0].driveKey).toBe('social');
   });
 
-  it('scheduleTask 失败时不标记已触发（方便下个判断窗口重试），但记一条 schedule-failed 日志', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0.001);
-    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 60_000);
+  it('fatigue 过线时：仍然触发（安静地歇着），但不走标准 satisfy 回落，只是 fatigue 缓一口气', async () => {
+    writeDriveState('char-a', { ...ZERO, curiosity: 0.95, fatigue: 0.9 });
+    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000);
+    const scheduleTask = vi.fn().mockResolvedValue(undefined);
+    const result = await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
+    expect(result.triggered).toBe(true);
+    expect(result.driveKey).toBe('fatigue');
+    const after = readDriveState('char-a');
+    expect(after.curiosity).toBeGreaterThan(0.9); // 没被 satisfy 打下去（只自然涨了一点）
+    expect(after.fatigue).toBeLessThan(0.9); // 缓了一口气
+    expect(after.fatigue).toBeGreaterThanOrEqual(FATIGUE_REST_GATE - 0.1);
+  });
+
+  it('scheduleTask 失败时不标记已唤醒（下一拍还会再评估），但记一条 schedule-failed 日志', async () => {
+    writeDriveState('char-a', { ...ZERO, social: 0.9 });
+    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000);
     const scheduleTask = vi.fn().mockRejectedValue(new Error('network down'));
     const result = await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
-    expect(result).toEqual({ triggered: false, reason: 'schedule-failed' });
+    expect(result.triggered).toBe(false);
+    expect(result.reason).toBe('schedule-failed');
     expect(readLifeWakeState('char-a').lastWakeAt).toBe(0);
-    expect(readLifeWakeLog('char-a')).toEqual([{ charId: 'char-a', at: now.getTime(), reason: 'schedule-failed' }]);
+    const log = readLifeWakeLog('char-a');
+    expect(log[0].reason).toBe('schedule-failed');
+    expect(log[0].driveKey).toBe('social');
+  });
+});
+
+describe('attachLifeWakeExcerpt', () => {
+  it('能给一条已有的日志条目回填摘要', async () => {
+    writeDriveState('char-a', { ...ZERO, social: 0.9 });
+    const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000);
+    const scheduleTask = vi.fn().mockResolvedValue(undefined);
+    await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
+    attachLifeWakeExcerpt('char-a', now.getTime(), '去逛了逛');
+    const log = readLifeWakeLog('char-a');
+    expect(log[0].excerpt).toBe('去逛了逛');
+  });
+
+  it('找不到对应条目时什么也不做（不抛错）', () => {
+    expect(() => attachLifeWakeExcerpt('char-x', 123, '摘要')).not.toThrow();
+    expect(readLifeWakeLog('char-x')).toEqual([]);
   });
 });
 
 describe('readLifeWakeLog / clearLifeWakeLog', () => {
   it('按时间倒序返回，且可以只看某个角色的', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0.001);
-    const base = dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 60_000;
+    writeDriveState('char-a', { ...ZERO, social: 0.9 });
+    writeDriveState('char-b', { ...ZERO, social: 0.9 });
+    const base = dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000;
     const scheduleTask = vi.fn().mockResolvedValue(undefined);
     await maybeTriggerLifeWake({ charId: 'char-a', now: new Date(base), scheduleTask });
-    await maybeTriggerLifeWake({ charId: 'char-b', now: new Date(base + MIN_WAKE_INTERVAL_MS + 1000), scheduleTask });
+    await maybeTriggerLifeWake({ charId: 'char-b', now: new Date(base + 1000), scheduleTask });
 
     const all = readLifeWakeLog();
     expect(all.map((e) => e.charId)).toEqual(['char-b', 'char-a']); // 倒序：最新的在前
@@ -139,8 +158,9 @@ describe('readLifeWakeLog / clearLifeWakeLog', () => {
   });
 
   it('clearLifeWakeLog 不传 charId 清空全部；传 charId 只清那一个角色的', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0.001);
-    const base = dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 60_000;
+    writeDriveState('char-a', { ...ZERO, social: 0.9 });
+    writeDriveState('char-b', { ...ZERO, social: 0.9 });
+    const base = dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000;
     const scheduleTask = vi.fn().mockResolvedValue(undefined);
     await maybeTriggerLifeWake({ charId: 'char-a', now: new Date(base), scheduleTask });
     await maybeTriggerLifeWake({ charId: 'char-b', now: new Date(base), scheduleTask });
