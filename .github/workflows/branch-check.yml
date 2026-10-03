@@ -3,9 +3,9 @@ name: Branch check
 # 分支自检：非 master 分支每次推送、以及往 master 提的 PR，都跑一遍 worker 打包 + 前端类型检查
 # + 相关单测。只读、不部署，用来在合并前发现编译/测试错误。失败时把日志末尾自动贴到 PR 评论里。
 #
-# 单测只跑 worker/、utils/amsg*、utils/lifeWake* 这几块（主动消息 + 定时唤醒相关）。
-# 其余测试（live2d、分享导出等）依赖浏览器环境，在 CI 的纯 Node 里本来就会报
-# "navigator is not defined"，跟我们的改动无关。
+# 单测只跑 worker/、utils/amsg*、utils/lifeWake*、utils/desireSystem* 这几块
+# （主动消息 + 定时唤醒 + 欲望驱动状态机相关）。其余测试（live2d、分享导出等）依赖浏览器
+# 环境，在 CI 的纯 Node 里本来就会报 "navigator is not defined"，跟我们的改动无关。
 #
 # 排除 amsgStateSync.gaps.test.ts：这是原仓库自带的一个用正则检查源码文本的测试，
 # 在 master 上就已经挂着（updateWorldbooks 的写法和它期望的正则对不上），
@@ -65,8 +65,8 @@ jobs:
       - name: Typecheck (frontend incl. OSContext.tsx)
         run: pnpm exec tsc --noEmit 2>&1 | tee typecheck.log
 
-      - name: Unit tests (amsg + lifeWake)
-        run: pnpm exec vitest run worker utils/amsg utils/lifeWake --exclude '**/amsgStateSync.gaps.test.ts' 2>&1 | tee test.log
+      - name: Unit tests (amsg + lifeWake + desireSystem)
+        run: pnpm exec vitest run worker utils/amsg utils/lifeWake utils/desireSystem --exclude '**/amsgStateSync.gaps.test.ts' 2>&1 | tee test.log
 
       - name: Report failure to PR
         if: failure() && github.event_name == 'pull_request'
