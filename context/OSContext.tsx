@@ -67,7 +67,8 @@ import {
   type MemoryAutoArchiveSyncDetail,
 } from '../utils/memoryPalace/autoArchive';
 import { ActiveMsgClient } from '../utils/activeMsgClient';
-import { resolveCharTimeZone } from '../utils/timezone';
+import { resolveCharTimeZone, nowInTimeZone } from '../utils/timezone';
+import { maybeTriggerLifeWake, attachLifeWakeExcerpt, WAKE_CHECK_INTERVAL_MS } from '../utils/lifeWake';
 import { ActiveMsgStore, backupHasBackendConnection, exportAmsg2GlobalConfig } from '../utils/activeMsgStore';
 import { charMayHaveCloudState, purgeCharCloudState, purgeCloudCharById } from '../utils/amsg2CharCleanup';
 import { parseCharCredId } from '../utils/amsgLlmCredentials';
@@ -2225,6 +2226,103 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   realtimeConfigRef.current = realtimeConfig;
   const memoryPalaceConfigRef = useRef(memoryPalaceConfig);
   memoryPalaceConfigRef.current = memoryPalaceConfig;
+    // 「后台生活 / 定时唤醒」——独立调度，复用同一批 refs 拿最新状态（与上面「彼方」自主
+  // 登入同一个模式）。判断逻辑（要不要现在唤醒）在 utils/lifeWake.ts 里，纯函数、有单测；
+  // 这里只负责按 WAKE_CHECK_INTERVAL_MS 定期跑一遍判断，命中了就走现成的主动消息生成
+  // 流程（mode='prompted'，同样能用工具）——不是新开一条通道。
+  //
+  // v1 的开关复用了「这个角色已经开了主动消息 2.0」这个现成条件（char.activeMsg2Config
+  // ?.enabled），还没有单独的"是否要后台生活"开关；先能跑起来验证判断逻辑合不合适，
+  // 后面要加独立开关再补一个字段进 activeMsg2Config，不影响这里的调用方式。
+  useEffect(() => {
+      if (!isDataLoaded || characters.length === 0) return;
+      let cancelled = false;
+      const checkLifeWake = async () => {
+          if (cancelled || !userProfileRef.current) return;
+          for (const char of charactersRef.current) {
+              if (cancelled) return;
+              const config = char.activeMsg2Config;
+              if (!config?.enabled) continue;
+              // 用户正在跟这个角色聊天 / 见面 / 通话时不打断——跟已有的几处主动消息
+              // 判断同一个口径（activeAppRef / suspendedCallRef 是本文件前面已经维护的 ref）。
+              if (activeAppRef.current === AppID.Chat && activeCharIdScheduleRef.current === char.id) continue;
+              if (activeAppRef.current === AppID.Date && activeCharIdScheduleRef.current === char.id) continue;
+              if (activeAppRef.current === AppID.Call && activeCharIdScheduleRef.current === char.id) continue;
+              if (suspendedCallRef.current?.charId === char.id) continue;
+
+                        try {
+                  const checkNow = new Date();
+                  const result = await maybeTriggerLifeWake({
+                      charId: char.id,
+                      now: checkNow,
+                      scheduleTask: async (promptHint) => {
+                          const charTz = resolveCharTimeZone(char);
+                          // 裸墙钟字符串，按角色时区写：跟工具桥排程用的是同一份格式
+                          // （resolveSendAtMs 按 tzId 解释），不能直接塞 ISO 绝对时间。
+                          const target = nowInTimeZone(charTz, new Date(Date.now() + 90_000));
+                          const pad = (n: number) => String(n).padStart(2, '0');
+                          const wallClock = `${target.getFullYear()}-${pad(target.getMonth() + 1)}-${pad(target.getDate())}`
+                              + `T${pad(target.getHours())}:${pad(target.getMinutes())}:${pad(target.getSeconds())}`;
+                          await ActiveMsgClient.scheduleCharacterTask({
+                              char,
+                              config,
+                              task: {
+                                  mode: 'prompted',
+                                  firstSendTime: wallClock,
+                                  recurrenceType: 'none',
+                                  promptHint,
+                                  selfScheduled: true,
+                              },
+                              userProfile: userProfileRef.current!,
+                              groups: groupsRef.current,
+                              realtimeConfig: realtimeConfigRef.current,
+                              apiConfig: apiConfigRef.current,
+                          });
+                      },
+                  });
+
+                  // 触发成功后，排程只是把生成任务扔出去，角色实际做了什么是异步产生的——
+                  // 而且不一定是发消息：也可能是调用工具/上网查东西，落下来的是别的消息类型
+                  // （比如网页卡片），不是普通文字。延迟几分钟后去聊天记录里找角色这之后
+                  // 新发的第一条消息（不限类型），按类型区分摘要文字；找不到任何新消息
+                  // （真的什么都没做/没落下痕迹）才保持日志原样不补。
+                  if (result.triggered) {
+                      const triggeredAt = checkNow.getTime();
+                      const charIdForLookup = char.id;
+                      setTimeout(() => {
+                          void (async () => {
+                              try {
+                                  const msgs = await DB.getMessagesByCharId(charIdForLookup);
+                                  const found = msgs
+                                      .filter((m) => m.role === 'assistant' && m.timestamp > triggeredAt)
+                                      .sort((a, b) => a.timestamp - b.timestamp)[0];
+                                  if (found) {
+                                      let excerpt: string;
+                                      if (found.type === 'text' && typeof found.content === 'string' && found.content.trim()) {
+                                          excerpt = found.content.length > 60 ? `${found.content.slice(0, 60)}…` : found.content;
+                                      } else {
+                                          // 非文字类型（工具调用产出的卡片等）：不猜内容，只标明"做了点什么、是哪类"，
+                                          // 具体细节用户自己去聊天记录里看对应的卡片。
+                                          excerpt = `（做了点什么——消息类型：${found.type}，不是普通文字，去聊天记录里看详情）`;
+                                      }
+                                      attachLifeWakeExcerpt(charIdForLookup, triggeredAt, excerpt);
+                                  }
+                              } catch (e) {
+                                  console.warn('[LifeWake] 补充日志摘要失败', charIdForLookup, e);
+                              }
+                          })();
+                      }, 3 * 60_000);
+                  }
+              } catch (e) {
+                  // 单个角色判断/排程出错不该打断其余角色这一轮的检查。
+                  console.warn('[LifeWake] 判断/排程失败', char.id, e);
+              }
+          }
+      };
+      const timer = setInterval(() => { void checkLifeWake(); }, WAKE_CHECK_INTERVAL_MS);
+      void checkLifeWake();
+      return () => { cancelled = true; clearInterval(timer); };
+  }, [isDataLoaded, characters]);
 
   useEffect(() => {
       if (!isDataLoaded) return;

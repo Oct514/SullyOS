@@ -26,6 +26,7 @@ export enum AppID {
   XhsStock = 'xhs_stock', // XHS image stock for publishing
   SpecialMoments = 'special_moments', // Valentine's Day & future events
   XhsFreeRoam = 'xhs_free_roam', // Character autonomous XHS activity
+  LifeWakeLog = 'life_wake_log', // 唤醒日志 — 定时唤醒判断记录（每次检查/触发/未触发）
   Songwriting = 'songwriting', // Songwriting / Lyric creation app
   Call = 'call', // 语音电话测试（MiniMax TTS）
   VoiceDesigner = 'voice_designer', // 捏声音 — MiniMax 音色设计器
@@ -3649,7 +3650,7 @@ export interface LifeRecordSettings {
     hiddenModules?: LifeRecordModule[];
     /** 锻炼周计划：每周目标次数（角色会据此监督执行） */
     exerciseWeeklyGoal?: number;
-    /** 锻炼周计划：文字规划（如"周一跑步 / 周四力量"），会注入给角色 */
+    /** 锻炼周计划：文字规划（如"周一跑步 / 周四力量"），会注入给角色） */
     exercisePlanNote?: string;
 }
 

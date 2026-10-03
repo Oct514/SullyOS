@@ -36,6 +36,7 @@ import {
   Planet,
   Wrench,
   HouseLine,
+  MoonStars,
 } from '@phosphor-icons/react';
 
 // SVG 图标库 - Phosphor Icons
@@ -61,6 +62,7 @@ export const Icons: Record<string, React.FC<{ className?: string }>> = {
   Novel: ({ className }) => <PenNib className={className} weight="regular" />,
   Bank: ({ className }) => <PiggyBank className={className} weight="regular" />,
   XhsFreeRoam: ({ className }) => <Compass className={className} weight="regular" />,
+  LifeWakeLog: ({ className }) => <MoonStars className={className} weight="regular" />,
   XhsStock: ({ className }) => <Camera className={className} weight="regular" />,
   SpecialMoments: ({ className }) => <Sparkle className={className} weight="regular" />,
   Browser: ({ className }) => <GlobeSimple className={className} weight="regular" />,
@@ -106,6 +108,7 @@ export const INSTALLED_APPS: AppConfig[] = [
   { id: AppID.FAQ, name: '使用帮助', icon: 'FAQ', color: 'indigo' },
   { id: AppID.Gallery, name: '相册', icon: 'Gallery', color: 'orange' },
   { id: AppID.XhsFreeRoam, name: '自由活动', icon: 'XhsFreeRoam', color: 'rose' },
+  { id: AppID.LifeWakeLog, name: '唤醒日志', icon: 'LifeWakeLog', color: 'indigo' },
   { id: AppID.XhsStock, name: '小红书图库', icon: 'XhsStock', color: 'red' },
   { id: AppID.ThemeMaker, name: '气泡工坊', icon: 'ThemeMaker', color: 'purple' },
   { id: AppID.Appearance, name: '外观', icon: 'Appearance', color: 'slate' },
