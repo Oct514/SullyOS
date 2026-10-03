@@ -9,8 +9,9 @@
  * 接口对接 + 记日志，依然不 import activeMsgClient 或任何 CharacterProfile 之类的应用类型，
  * 只认 charId 这个字符串。
  *
- * 对外接口形状没变（maybeTriggerLifeWake 的参数和返回值跟上一版一样），所以接入
- * context/OSContext.tsx 的那段代码不用跟着改。
+ * 对外接口形状基本没变（maybeTriggerLifeWake 多了一个可选的 personaText 参数，不传就是
+ * 旧行为），所以接入 context/OSContext.tsx 的那段代码大体不用跟着改——只有想真正用上
+ * 「按人设调整驱动速度」这个新功能时，才需要在调用处多传一个 personaText。
  *
  * v1 范围：唤醒之后走的还是已有的主动消息生成流程（mode='prompted'，能用工具），不是
  * 另开一条通道；这次唤醒最终会不会真的发出一条消息，由那条流程自己判断——这里只负责
@@ -186,11 +187,15 @@ export const attachLifeWakeExcerpt = (charId: string, at: number, excerpt: strin
  *
  * @param scheduleTask 真正去排程/生成的函数，由调用方注入——拿的是当下的角色配置、
  *   用户资料这些，这个文件完全不关心它们的具体类型。
+ * @param personaText 角色的人设文本（描述 + 系统提示词等拼起来），传进去会让欲望状态机
+ *   按人设关键词调整各维度的上升速度（见 desireSystem.computePersonaDriveWeights）；
+ *   不传就是跟人设无关的旧行为。
  */
 export const maybeTriggerLifeWake = async (args: {
   charId: string;
   now?: Date;
   scheduleTask: (promptHint: string) => Promise<void>;
+  personaText?: string;
 }): Promise<TriggerLifeWakeResult> => {
   const now = args.now ?? new Date();
   const { lastWakeAt } = readLifeWakeState(args.charId);
@@ -199,7 +204,7 @@ export const maybeTriggerLifeWake = async (args: {
     return { triggered: false, reason: 'not-due' };
   }
 
-  const { intent } = tickDesire(args.charId, now);
+  const { intent } = tickDesire(args.charId, now, args.personaText);
 
   if (!intent.gated && intent.score < WAKE_SCORE_THRESHOLD) {
     appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'missed', driveKey: intent.driveKey, score: intent.score });
