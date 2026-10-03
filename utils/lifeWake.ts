@@ -1,25 +1,42 @@
 /**
- * 定时唤醒（"后台生活"）：不聊天时，按时间窗口 + 概率决定要不要给角色一次自由发挥的机会。
+ * 定时唤醒（"后台生活"）：不聊天时，由欲望驱动状态机（见 utils/desireSystem.ts）决定要不要
+ * 给角色一次自由发挥的机会。
  *
- * 判断本身是纯函数、不碰浏览器状态以外的东西，方便单测；真正触发生成/排程那一步由调用方
- * 注入（见 maybeTriggerLifeWake 的 scheduleTask 参数）。这个文件不 import activeMsgClient
- * 或任何 CharacterProfile 之类的应用类型，只认 charId 这个字符串——判断逻辑和排程接口的
- * 具体形状不焊死在一起，以后排程那边怎么改都不会牵连到这儿。
+ * 这个文件现在是「欲望状态机」和「主动消息排程」之间的胶水层：每次检查先让状态机推进一拍
+ * （desireSystem.tickDesire），算出此刻最该发作的维度，分数够了才真的去排程；排程成功后
+ * 调 desireSystem.satisfyAfterAction 让相关维度回落。判断逻辑本身（状态机那部分）在
+ * desireSystem.ts 里是纯函数、有自己的单测；这个文件只负责「要不要去问一次」+ 跟外部排程
+ * 接口对接 + 记日志，依然不 import activeMsgClient 或任何 CharacterProfile 之类的应用类型，
+ * 只认 charId 这个字符串。
  *
- * v1 范围：只做「要不要现在唤醒」的判断 + 给一句方向提示 + 记一份技术日志（唤醒日志
- * App 读这份日志）。唤醒之后走的是已有的主动消息生成流程（mode='prompted'，同样能用
- * 工具），不是另开一条通道；这次唤醒最终会不会真的发出一条消息，由那条流程自己判断——
- * 这里只负责「要不要去问一次」，不负责「问完必须说话」。
+ * 对外接口形状没变（maybeTriggerLifeWake 的参数和返回值跟上一版一样），所以接入
+ * context/OSContext.tsx 的那段代码不用跟着改。
  *
- * 已接入 context/OSContext.tsx：每 WAKE_CHECK_INTERVAL_MS 对每个开了「主动消息2.0」的
- * 角色跑一遍 maybeTriggerLifeWake；触发成功后会延迟去聊天记录里找角色新发的那条消息，
- * 摘一段文字回填进日志（见 attachLifeWakeExcerpt）——这一步因为要读聊天数据库，不放在
- * 这个纯函数文件里做，由 OSContext 调用 DB 读完后再调 attachLifeWakeExcerpt 写回。
+ * v1 范围：唤醒之后走的还是已有的主动消息生成流程（mode='prompted'，能用工具），不是
+ * 另开一条通道；这次唤醒最终会不会真的发出一条消息，由那条流程自己判断——这里只负责
+ * 「要不要去问一次」+「往哪个方向问」，不负责「问完必须说话」。
  *
- * ⚠️ 下面的时间/概率常数目前是「测试档」（2026-10 调），为了在部署出来的测试站上几分钟
- * 内就能看到效果，刻意调短/调高了。正式长期使用前应该调回更保守的值（比如 90 分钟冷却 +
- * 15 分钟检查 + 白天 12% / 夜里 4%），否则角色会醒得过于频繁。
+ * ⚠️ WAKE_CHECK_INTERVAL_MS 和 desireSystem 里的分数门槛/上升速度目前都是「测试档」，为了
+ * 在部署出来的测试站上几分钟内就能看到效果调快了。正式长期使用前应该放慢，不然角色会醒得
+ * 过于频繁。
  */
+
+import {
+  tickDesire,
+  satisfyAfterAction,
+  relieveAfterGatedRest,
+  HINT_FOR_DRIVE,
+  WAKE_SCORE_THRESHOLD,
+  type DriveKey,
+  type NonFatigueDriveKey,
+} from './desireSystem';
+
+/** 每个角色「刚判断过」的极短安全阀，只防止同一拍/相邻两拍重复触发，不承担节奏控制——
+ *  真正的节奏由欲望状态机的涨落 + satisfy 回落决定。测试档：2 分钟。 */
+export const MIN_WAKE_INTERVAL_MS = 2 * 60_000;
+
+/** 判断窗口建议值：调用方大概多久检查一次「现在要不要醒」。测试档：1 分钟（正式值建议 15 分钟）。 */
+export const WAKE_CHECK_INTERVAL_MS = 60_000;
 
 /** 每个角色的唤醒状态，存在 localStorage，key 里带 charId，值只有一个时间戳。 */
 interface LifeWakeState {
@@ -48,67 +65,15 @@ export const markLifeWaked = (charId: string, at: number): void => {
   }
 };
 
-// ─── 唤醒概率（测试档，见文件头注释） ───
-
-/** 两次唤醒之间最少隔多久，防止判断跑得勤就把角色吵得很勤。测试档：3 分钟（正式值 90 分钟）。 */
-export const MIN_WAKE_INTERVAL_MS = 3 * 60_000;
-
-/** 判断窗口建议值：够久没醒的角色，调用方大概多久检查一次「现在要不要醒」。测试档：1 分钟（正式值 15 分钟）。 */
-export const WAKE_CHECK_INTERVAL_MS = 60_000;
-
-/**
- * 白天（本地 6:00-24:00）单次判断的命中概率。测试档：35%（正式值 12%）。
- * 导出是为了让单测能按当前实际值算中间值，不用在测试里写死一个跟这两个常数脱钩的骰子数——
- * 之前就是因为测试写死了 0.06 这个数，这两个常数从正式档改成测试档之后它才忽然跟着炸了。
- */
-export const DAY_WAKE_CHANCE = 0.35;
-/** 夜里（本地 0:00-6:00）单次判断的命中概率，仍比白天低一截。测试档：15%（正式值 4%）。 */
-export const NIGHT_WAKE_CHANCE = 0.15;
-
-const isNightHour = (hour: number): boolean => hour >= 0 && hour < 6;
-
-/** 是否已经过了「冷却期」，到了可以认真判断一次的时间点（不管概率结果如何）。 */
-export const isWakeDue = (now: Date, lastWakeAt: number): boolean =>
+const isWakeDue = (now: Date, lastWakeAt: number): boolean =>
   now.getTime() - lastWakeAt >= MIN_WAKE_INTERVAL_MS;
-
-const rollHits = (now: Date, roll: number): boolean => {
-  const chance = isNightHour(now.getHours()) ? NIGHT_WAKE_CHANCE : DAY_WAKE_CHANCE;
-  return roll < chance;
-};
-
-/**
- * 这一次判断该不该唤醒（= 过了冷却期 且 概率骰中）。
- *
- * @param now 当前时间
- * @param lastWakeAt 上次唤醒的时间戳（0 = 从没醒过）
- * @param roll 0..1 的随机数；测试时传固定值，正常调用不传，内部用 Math.random()
- */
-export const shouldWakeNow = (
-  now: Date,
-  lastWakeAt: number,
-  roll: number = Math.random(),
-): boolean => isWakeDue(now, lastWakeAt) && rollHits(now, roll);
-
-// ─── 方向提示 ───
-
-/**
- * 给到点生成流程的方向提示（mode='prompted' 时的 promptHint）。
- *
- * 刻意不要求「必须说话」：唤醒只是给一次自由活动的机会，说不说、说什么交给生成流程自己
- * 判断（它能调用工具去查东西，也可以这次什么都不发）。写得太硬性（"必须联系用户"）只会
- * 导致每次唤醒都硬凑一句无意义的话，跟这次改造想解决的问题背道而驰。
- */
-export const LIFE_WAKE_PROMPT_HINT = [
-  '现在是你的自由时间，不是在回复谁。',
-  '你可以做任何这会儿想做的事——用手上的工具去查点感兴趣的东西、随便逛逛，',
-  '或者什么都不做，安安静静待一会儿。',
-  '不必硬找话题联系对方：只有当你真的有想说的、或者做了什么想告诉 ta 的事，才开口；',
-  '没有的话，写一两句简短的自言自语就够了，不必长篇大论。',
-].join('');
 
 export interface TriggerLifeWakeResult {
   triggered: boolean;
   reason: 'scheduled' | 'not-due' | 'missed' | 'schedule-failed';
+  /** 这次判断里分数最高/被闸住的维度，方便调用方（日志）展示；安全阀没过时为 undefined。 */
+  driveKey?: DriveKey;
+  score?: number;
 }
 
 // ─── 唤醒日志（唤醒日志 App 读这份；技术记录 + 事后补上的内容摘要） ───
@@ -124,20 +89,29 @@ export interface LifeWakeLogEntry {
   /** 本次判断的时间戳（epoch ms）。 */
   at: number;
   reason: LifeWakeLogReason;
+  /** 这次判断里分数最高/被闸住的维度（欲望状态机接入后新增，方便在日志里看出「为什么」）。 */
+  driveKey?: DriveKey;
+  /** 该维度此刻的分数（0..1 左右，执念加成可能让它略超 1）。 */
+  score?: number;
   /**
-   * 触发成功后，角色实际说了什么的摘录（由调用方事后读聊天记录回填，见
-   * attachLifeWakeExcerpt）。写日志这一刻还不知道角色会不会说话/说什么——
-   * 排程只是把生成任务扔出去，真正生成是异步的——所以这个字段一开始总是空的。
+   * 触发成功后，角色实际说了什么/做了什么的摘录（由调用方事后读聊天记录回填，见
+   * attachLifeWakeExcerpt）。写日志这一刻还不知道角色会不会说话/说什么——排程只是把
+   * 生成任务扔出去，真正生成是异步的——所以这个字段一开始总是空的。
    */
   excerpt?: string;
 }
+
+const isDriveKeyLike = (v: unknown): v is DriveKey =>
+  typeof v === 'string' && ['attachment', 'curiosity', 'reflection', 'duty', 'social', 'fatigue', 'libido', 'stress'].includes(v);
 
 const isLifeWakeLogReason = (v: unknown): v is LifeWakeLogReason =>
   v === 'triggered' || v === 'missed' || v === 'schedule-failed';
 
 const isLifeWakeLogEntry = (v: any): v is LifeWakeLogEntry =>
   !!v && typeof v.charId === 'string' && typeof v.at === 'number' && isLifeWakeLogReason(v.reason)
-  && (v.excerpt === undefined || typeof v.excerpt === 'string');
+  && (v.excerpt === undefined || typeof v.excerpt === 'string')
+  && (v.driveKey === undefined || isDriveKeyLike(v.driveKey))
+  && (v.score === undefined || typeof v.score === 'number');
 
 const readAllLogEntriesRaw = (): LifeWakeLogEntry[] => {
   try {
@@ -201,8 +175,14 @@ export const attachLifeWakeExcerpt = (charId: string, at: number, excerpt: strin
 };
 
 /**
- * 判断 + （命中的话）真正触发一次；全程往 LifeWakeLog 里记一笔——除了「还在冷却期」
- * 这种高频、不值得看的情况（15 分钟一次全角色跑，冷却期内每次都记会把日志刷满噪音）。
+ * 判断 + （命中的话）真正触发一次。
+ *
+ * 流程：先检查极短安全阀（避免同一拍/相邻拍重复触发）→ 让欲望状态机推进一拍，算出此刻最该
+ * 发作的维度和分数 → fatigue 闸住了，直接按「安静地歇着」处理（仍算一次「触发」，用
+ * fatigue 对应的方向提示，排程成功后只缓一口气、不走标准 satisfy 回落表）→ 没被闸住但分数
+ * 不够门槛，这次不触发（记一条 missed 日志，带上当时的维度和分数，方便看出「攒了多少」）→
+ * 分数够了，用对应维度的方向提示去排程，成功就标记已唤醒、让相关维度回落（会让 fatigue
+ * 涨一点），失败就只记日志、不标记已唤醒（下一拍还会再评估一次，不会被罚等一整个安全阀周期）。
  *
  * @param scheduleTask 真正去排程/生成的函数，由调用方注入——拿的是当下的角色配置、
  *   用户资料这些，这个文件完全不关心它们的具体类型。
@@ -219,21 +199,31 @@ export const maybeTriggerLifeWake = async (args: {
     return { triggered: false, reason: 'not-due' };
   }
 
-  if (!rollHits(now, Math.random())) {
-    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'missed' });
-    return { triggered: false, reason: 'missed' };
+  const { intent } = tickDesire(args.charId, now);
+
+  if (!intent.gated && intent.score < WAKE_SCORE_THRESHOLD) {
+    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'missed', driveKey: intent.driveKey, score: intent.score });
+    return { triggered: false, reason: 'missed', driveKey: intent.driveKey, score: intent.score };
   }
 
+  const promptHint = HINT_FOR_DRIVE[intent.driveKey];
+
   try {
-    await args.scheduleTask(LIFE_WAKE_PROMPT_HINT);
+    await args.scheduleTask(promptHint);
   } catch (error) {
-    // 排程失败不标记「已唤醒」：下一个判断窗口还会再试一次，别因为一次网络抖动
-    // 就把这个角色晾整整一个 MIN_WAKE_INTERVAL_MS。
+    // 排程失败不标记「已唤醒」：下一拍还会再评估一次，别因为一次网络抖动
+    // 就把这个角色晾整整一个安全阀周期。
     console.warn('[lifeWake] 排程失败，下次判断窗口再试', args.charId, error);
-    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'schedule-failed' });
-    return { triggered: false, reason: 'schedule-failed' };
+    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'schedule-failed', driveKey: intent.driveKey, score: intent.score });
+    return { triggered: false, reason: 'schedule-failed', driveKey: intent.driveKey, score: intent.score };
+  }
+
+  if (intent.gated) {
+    relieveAfterGatedRest(args.charId);
+  } else {
+    satisfyAfterAction(args.charId, intent.driveKey as NonFatigueDriveKey);
   }
   markLifeWaked(args.charId, now.getTime());
-  appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'triggered' });
-  return { triggered: true, reason: 'scheduled' };
+  appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'triggered', driveKey: intent.driveKey, score: intent.score });
+  return { triggered: true, reason: 'scheduled', driveKey: intent.driveKey, score: intent.score };
 };
