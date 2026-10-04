@@ -17,6 +17,10 @@
  * 另开一条通道；这次唤醒最终会不会真的发出一条消息，由那条流程自己判断——这里只负责
  * 「要不要去问一次」+「往哪个方向问」，不负责「问完必须说话」。
  *
+ * 【2026-10 修】fatigue 闸住、「安静地歇着」的那次**不再调用 scheduleTask**——歇着不需要
+ * 生成任何内容，纯本地判定，不花 token。对应的日志 reason 也单独叫 'rested'，跟真的排程
+ * 生成过的 'triggered' 分开，日志面板上能一眼看出哪些是真动作、哪些只是没醒透歇了一下。
+ *
  * ⚠️ WAKE_CHECK_INTERVAL_MS 和 desireSystem 里的分数门槛/上升速度目前都是「测试档」，为了
  * 在部署出来的测试站上几分钟内就能看到效果调快了。正式长期使用前应该放慢，不然角色会醒得
  * 过于频繁。
@@ -71,7 +75,7 @@ const isWakeDue = (now: Date, lastWakeAt: number): boolean =>
 
 export interface TriggerLifeWakeResult {
   triggered: boolean;
-  reason: 'scheduled' | 'not-due' | 'missed' | 'schedule-failed';
+  reason: 'scheduled' | 'not-due' | 'missed' | 'schedule-failed' | 'rested';
   /** 这次判断里分数最高/被闸住的维度，方便调用方（日志）展示；安全阀没过时为 undefined。 */
   driveKey?: DriveKey;
   score?: number;
@@ -83,7 +87,7 @@ const LOG_KEY = 'lifeWake_log';
 /** 日志条数上限，超出后丢最旧的；纯调试用途，不需要无限堆积。 */
 const LOG_MAX_ENTRIES = 200;
 
-export type LifeWakeLogReason = 'triggered' | 'missed' | 'schedule-failed';
+export type LifeWakeLogReason = 'triggered' | 'missed' | 'schedule-failed' | 'rested';
 
 export interface LifeWakeLogEntry {
   charId: string;
@@ -97,7 +101,8 @@ export interface LifeWakeLogEntry {
   /**
    * 触发成功后，角色实际说了什么/做了什么的摘录（由调用方事后读聊天记录回填，见
    * attachLifeWakeExcerpt）。写日志这一刻还不知道角色会不会说话/说什么——排程只是把
-   * 生成任务扔出去，真正生成是异步的——所以这个字段一开始总是空的。
+   * 生成任务扔出去，真正生成是异步的——所以这个字段一开始总是空的。'rested' 这种根本
+   * 没调用过生成流程，永远不会有摘要。
    */
   excerpt?: string;
 }
@@ -106,7 +111,7 @@ const isDriveKeyLike = (v: unknown): v is DriveKey =>
   typeof v === 'string' && ['attachment', 'curiosity', 'reflection', 'duty', 'social', 'fatigue', 'libido', 'stress'].includes(v);
 
 const isLifeWakeLogReason = (v: unknown): v is LifeWakeLogReason =>
-  v === 'triggered' || v === 'missed' || v === 'schedule-failed';
+  v === 'triggered' || v === 'missed' || v === 'schedule-failed' || v === 'rested';
 
 const isLifeWakeLogEntry = (v: any): v is LifeWakeLogEntry =>
   !!v && typeof v.charId === 'string' && typeof v.at === 'number' && isLifeWakeLogReason(v.reason)
@@ -179,14 +184,14 @@ export const attachLifeWakeExcerpt = (charId: string, at: number, excerpt: strin
  * 判断 + （命中的话）真正触发一次。
  *
  * 流程：先检查极短安全阀（避免同一拍/相邻拍重复触发）→ 让欲望状态机推进一拍，算出此刻最该
- * 发作的维度和分数 → fatigue 闸住了，直接按「安静地歇着」处理（仍算一次「触发」，用
- * fatigue 对应的方向提示，排程成功后只缓一口气、不走标准 satisfy 回落表）→ 没被闸住但分数
- * 不够门槛，这次不触发（记一条 missed 日志，带上当时的维度和分数，方便看出「攒了多少」）→
- * 分数够了，用对应维度的方向提示去排程，成功就标记已唤醒、让相关维度回落（会让 fatigue
- * 涨一点），失败就只记日志、不标记已唤醒（下一拍还会再评估一次，不会被罚等一整个安全阀周期）。
+ * 发作的维度和分数 → fatigue 闸住了，直接按「安静地歇着」处理：**不调用 scheduleTask**，
+ * 不花 token，只是让 fatigue 缓一口气、记一条 'rested' 日志 → 没被闸住但分数不够门槛，这次
+ * 不触发（记一条 missed 日志，带上当时的维度和分数，方便看出「攒了多少」）→ 分数够了，用
+ * 对应维度的方向提示去排程，成功就标记已唤醒、让相关维度回落（会让 fatigue 涨一点），失败
+ * 就只记日志、不标记已唤醒（下一拍还会再评估一次，不会被罚等一整个安全阀周期）。
  *
  * @param scheduleTask 真正去排程/生成的函数，由调用方注入——拿的是当下的角色配置、
- *   用户资料这些，这个文件完全不关心它们的具体类型。
+ *   用户资料这些，这个文件完全不关心它们的具体类型。fatigue 闸住的那次根本不会调用它。
  * @param personaText 角色的人设文本（描述 + 系统提示词等拼起来），传进去会让欲望状态机
  *   按人设关键词调整各维度的上升速度（见 desireSystem.computePersonaDriveWeights）；
  *   不传就是跟人设无关的旧行为。
@@ -206,7 +211,15 @@ export const maybeTriggerLifeWake = async (args: {
 
   const { intent } = tickDesire(args.charId, now, args.personaText);
 
-  if (!intent.gated && intent.score < WAKE_SCORE_THRESHOLD) {
+  if (intent.gated) {
+    // 安静地歇着：不调用 scheduleTask，不花 token，只缓一口气 + 记日志。
+    relieveAfterGatedRest(args.charId);
+    markLifeWaked(args.charId, now.getTime());
+    appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'rested', driveKey: intent.driveKey, score: intent.score });
+    return { triggered: false, reason: 'rested', driveKey: intent.driveKey, score: intent.score };
+  }
+
+  if (intent.score < WAKE_SCORE_THRESHOLD) {
     appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'missed', driveKey: intent.driveKey, score: intent.score });
     return { triggered: false, reason: 'missed', driveKey: intent.driveKey, score: intent.score };
   }
@@ -223,11 +236,7 @@ export const maybeTriggerLifeWake = async (args: {
     return { triggered: false, reason: 'schedule-failed', driveKey: intent.driveKey, score: intent.score };
   }
 
-  if (intent.gated) {
-    relieveAfterGatedRest(args.charId);
-  } else {
-    satisfyAfterAction(args.charId, intent.driveKey as NonFatigueDriveKey);
-  }
+  satisfyAfterAction(args.charId, intent.driveKey as NonFatigueDriveKey);
   markLifeWaked(args.charId, now.getTime());
   appendLifeWakeLog({ charId: args.charId, at: now.getTime(), reason: 'triggered', driveKey: intent.driveKey, score: intent.score });
   return { triggered: true, reason: 'scheduled', driveKey: intent.driveKey, score: intent.score };
