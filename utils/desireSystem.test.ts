@@ -13,6 +13,7 @@ import {
   writeDriveState,
   readThoughts,
   writeThoughts,
+  computePersonaDriveWeights,
   FATIGUE_REST_GATE,
   FIXATION_DRIVE_BOOST,
   type DriveState,
@@ -55,6 +56,55 @@ describe('easeDrive', () => {
   it('fatigue 恢复有下限 0，不会变负', () => {
     const next = easeDrive({ ...ZERO, fatigue: 0.001 }, dayNoon());
     expect(next.fatigue).toBeGreaterThanOrEqual(0);
+  });
+
+  it('不传 weights 时，等同于所有维度权重=1（旧行为不变）', () => {
+    const withDefault = easeDrive(ZERO, dayNoon());
+    const withExplicit1 = easeDrive(ZERO, dayNoon(), {
+      attachment: 1, curiosity: 1, reflection: 1, duty: 1, social: 1, libido: 1, stress: 1,
+    });
+    expect(withDefault).toEqual(withExplicit1);
+  });
+
+  it('某个维度权重更高时，那个维度涨得更快，其它维度不受影响', () => {
+    const boosted = easeDrive(ZERO, dayNoon(), {
+      attachment: 2, curiosity: 1, reflection: 1, duty: 1, social: 1, libido: 1, stress: 1,
+    });
+    const baseline = easeDrive(ZERO, dayNoon());
+    expect(boosted.attachment).toBeCloseTo(baseline.attachment * 2, 5);
+    expect(boosted.curiosity).toBeCloseTo(baseline.curiosity, 5); // 没加权的维度不变
+  });
+});
+
+describe('computePersonaDriveWeights', () => {
+  it('空文本时所有维度权重都是 1（不影响旧行为）', () => {
+    const weights = computePersonaDriveWeights('');
+    expect(Object.values(weights).every((w) => w === 1)).toBe(true);
+  });
+
+  it('没命中任何关键词的文本，所有维度权重都是 1', () => {
+    const weights = computePersonaDriveWeights('一个普通的角色，喜欢喝咖啡。');
+    expect(Object.values(weights).every((w) => w === 1)).toBe(true);
+  });
+
+  it('命中"粘人"这类词，attachment 权重变高，其它维度不受影响', () => {
+    const weights = computePersonaDriveWeights('性格粘人，很黏人，总是舍不得对方离开。');
+    expect(weights.attachment).toBeGreaterThan(1);
+    expect(weights.curiosity).toBe(1);
+    expect(weights.social).toBe(1);
+  });
+
+  it('命中多个关键词时权重更高，但不会无限涨（有上限）', () => {
+    // 这几个词都在 attachment 关键词表里
+    const weights = computePersonaDriveWeights('粘人 黏人 依赖 舍不得 离不开 依恋 恋人 想念 黏着 粘着');
+    expect(weights.attachment).toBeLessThanOrEqual(2.6);
+  });
+
+  it('不同维度的关键词可以同时命中，互不冲突', () => {
+    const weights = computePersonaDriveWeights('外向爱热闹，同时又有点焦虑、压力大。');
+    expect(weights.social).toBeGreaterThan(1);
+    expect(weights.stress).toBeGreaterThan(1);
+    expect(weights.attachment).toBe(1);
   });
 });
 
@@ -164,6 +214,15 @@ describe('tickDesire / satisfyAfterAction / relieveAfterGatedRest（持久化整
     for (let i = 0; i < 5; i++) tickDesire('char-a', dayNoon());
     const drive = readDriveState('char-a');
     expect(drive.curiosity).toBeGreaterThan(0.05); // 5 拍比 1 拍高
+  });
+
+  it('传入人设文本时，对应维度涨得更快——不再是所有角色都「好奇」赢', () => {
+    const now = dayNoon();
+    const withoutPersona = tickDesire('char-plain', now);
+    const withPersona = tickDesire('char-clingy', now, '这个角色很粘人，特别黏人，总是舍不得。');
+    // 两边都是全新角色、同一时刻推进一拍：有人设加成的 attachment 应该比没加成的角色的
+    // attachment 涨得更多（同样起点 0，速度更快）。
+    expect(withPersona.drive.attachment).toBeGreaterThan(withoutPersona.drive.attachment);
   });
 
   it('satisfyAfterAction 会让相关维度回落、fatigue 升高，并持久化', () => {
