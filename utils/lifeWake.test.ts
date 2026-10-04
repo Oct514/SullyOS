@@ -96,17 +96,23 @@ describe('maybeTriggerLifeWake', () => {
     expect(log[0].driveKey).toBe('social');
   });
 
-  it('fatigue 过线时：仍然触发（安静地歇着），但不走标准 satisfy 回落，只是 fatigue 缓一口气', async () => {
-    writeDriveState('char-a', { ...ZERO, curiosity: 0.95, fatigue: 0.9 });
+  it('fatigue 过线时：不调用 scheduleTask（省token），记一条 rested 日志，fatigue 缓一口气', async () => {
+    writeDriveState('char-a', { ...ZERO, curiosity: 0.95, fatigue: 0.95 });
     const now = new Date(dayNoon().getTime() + MIN_WAKE_INTERVAL_MS + 1000);
     const scheduleTask = vi.fn().mockResolvedValue(undefined);
     const result = await maybeTriggerLifeWake({ charId: 'char-a', now, scheduleTask });
-    expect(result.triggered).toBe(true);
+    expect(result.triggered).toBe(false);
+    expect(result.reason).toBe('rested');
     expect(result.driveKey).toBe('fatigue');
+    expect(scheduleTask).not.toHaveBeenCalled(); // 歇着不花 token
+    expect(readLifeWakeState('char-a').lastWakeAt).toBe(now.getTime()); // 安全阀照样更新
     const after = readDriveState('char-a');
     expect(after.curiosity).toBeGreaterThan(0.9); // 没被 satisfy 打下去（只自然涨了一点）
-    expect(after.fatigue).toBeLessThan(0.9); // 缓了一口气
-    expect(after.fatigue).toBeGreaterThanOrEqual(FATIGUE_REST_GATE - 0.1);
+    expect(after.fatigue).toBeLessThan(0.95); // 缓了一口气
+    expect(after.fatigue).toBeGreaterThanOrEqual(FATIGUE_REST_GATE - 0.2);
+    const log = readLifeWakeLog('char-a');
+    expect(log[0].reason).toBe('rested');
+    expect(log[0].driveKey).toBe('fatigue');
   });
 
   it('scheduleTask 失败时不标记已唤醒（下一拍还会再评估），但记一条 schedule-failed 日志', async () => {
