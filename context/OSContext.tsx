@@ -2255,6 +2255,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   const result = await maybeTriggerLifeWake({
                       charId: char.id,
                       now: checkNow,
+                      personaText: `${char.description || ''} ${char.systemPrompt || ''}`,
                       scheduleTask: async (promptHint) => {
                           const charTz = resolveCharTimeZone(char);
                           // 裸墙钟字符串，按角色时区写：跟工具桥排程用的是同一份格式
