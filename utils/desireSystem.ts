@@ -21,6 +21,11 @@
  *   粘人」的角色真的更容易因为「想念」触发，而不是所有角色表现一致。这是关键词规则，不是
  *   LLM 语义理解——人设没写出典型关键词就匹配不到，判断比较死板，先用这个免费方案把链路
  *   跑通，以后想要更准可以换成调一次 LLM 分析人设的版本。
+ * - 【2026-10 修】fatigue 闸住后的「安静地歇着」本身不需要调用 LLM——这是 lifeWake.ts 那边
+ *   的改动（被闸住直接跳过 scheduleTask，不花 token），但连带把这里的 fatigue 涨/消速度
+ *   也重新调了一版：原先涨得比消得快太多，在短安全阀的测试档下很快就把大半唤醒名额耗在
+ *   「疲惫→歇着→疲惫」的循环里。现在涨得慢一点、消得快一点、缓一口气时松得更多（反正免费
+ *   了，不用省着用），别让 fatigue 一家独大。
  */
 
 export const DRIVE_KEYS = ['attachment', 'curiosity', 'reflection', 'duty', 'social', 'fatigue', 'libido', 'stress'] as const;
@@ -78,16 +83,16 @@ const RISE_PER_TICK: Record<NonFatigueDriveKey, number> = {
 const NIGHT_RISE_MULTIPLIER = 0.4;
 
 /** fatigue 闲置（没触发行动）时每拍恢复多少。 */
-const FATIGUE_RECOVER_PER_TICK = 0.02;
+const FATIGUE_RECOVER_PER_TICK = 0.03;
 /** 真正触发一次「没被 fatigue 闸住」的行动后，fatigue 涨多少。 */
-const FATIGUE_GAIN_ON_ACTION = 0.12;
-/** fatigue 被闸住时仍然「发作」了一次（安静地歇着），比真行动涨得少一些，但也不是没代价。 */
+const FATIGUE_GAIN_ON_ACTION = 0.08;
+/** fatigue 被闸住、安静地歇着那次——本身不调用 LLM（见 lifeWake.ts），免费，不用省着用。 */
 const FATIGUE_GAIN_ON_GATED_REST = 0.0;
-/** 被 fatigue 闸住、乖乖歇了一下之后，fatigue 缓一口气往下降一点。 */
-const FATIGUE_RELIEF_ON_GATED_REST = 0.1;
+/** 被 fatigue 闸住、乖乖歇了一下之后，fatigue 往下降多少——歇着免费，可以松得更多，尽快脱离「闸住」状态。 */
+const FATIGUE_RELIEF_ON_GATED_REST = 0.2;
 
 /** fatigue 到这个值，强制归为「歇着」，不管别的维度分数多高——这是闸，不是跟别人抢分的维度。 */
-export const FATIGUE_REST_GATE = 0.72;
+export const FATIGUE_REST_GATE = 0.75;
 
 export type DriveWeights = Record<NonFatigueDriveKey, number>;
 
