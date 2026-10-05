@@ -7,12 +7,14 @@ const REASON_LABEL: Record<LifeWakeLogEntry['reason'], string> = {
   triggered: '触发了自由活动',
   missed: '判断过，没触发',
   'schedule-failed': '想触发，但排程失败了',
+  rested: '太累了，安静歇着（没花token）',
 };
 
 const REASON_STYLE: Record<LifeWakeLogEntry['reason'], string> = {
   triggered: 'text-emerald-600 bg-emerald-50',
   missed: 'text-slate-400 bg-slate-100',
   'schedule-failed': 'text-red-500 bg-red-50',
+  rested: 'text-amber-500 bg-amber-50',
 };
 
 /** 驱动维度的中文名，日志里按这个显示，比看英文 key 直观。 */
@@ -97,7 +99,8 @@ const LifeWakeLogApp: React.FC = () => {
             <p className="text-sm text-slate-500 font-bold">还没有唤醒记录</p>
             <p className="text-[11px] text-slate-400 leading-relaxed max-w-[240px]">
               开着某个已开启"主动消息2.0"的角色的聊天页面一段时间，这里会记录每次欲望状态机
-              判断"要不要让 ta 自由活动"的结果，包括判断过但分数还没攒够门槛的次数。
+              判断"要不要让 ta 自由活动"的结果，包括判断过但分数还没攒够门槛、或者太累了只是
+              安静歇着的次数（歇着不会真的调用AI，不花token）。
             </p>
           </div>
         ) : (
