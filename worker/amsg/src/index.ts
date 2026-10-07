@@ -197,6 +197,7 @@ import { buildTickReport, readOverdueTasks, recordTickOutcome, type TickReportDb
 import type { ActiveMsg2TaskRecord } from '../../../types';
 import { createHybridPushTransport, isFcmConfigured, type NativeFcmEnv } from './nativeFcm';
 import { configureSkipDiagnostics, isDebugFlagOn, logSkipDiagnostic } from './skipDiagnostics';
+import { configureTriggerGate, decideGate, isWatchTask } from './triggerGate';
 
 interface Env extends NativeFcmEnv {
   AMSG_MASTER_KEY: string;
@@ -205,6 +206,8 @@ interface Env extends NativeFcmEnv {
   VAPID_PRIVATE_KEY: string;
   /** 可选共享密钥；配了才校验 X-Client-Token，不配则端点全开。 */
   AMSG_SERVER_TOKEN?: string;
+  TRIGGER_URL?: string;
+  TRIGGER_TOKEN?: string;
   /**
    * 排查「模型这轮没说话」时临时打开：填 1 后，跳过诊断日志（[amsg:skip-diag]）会带上模型回复的
    * 原文片段。默认只记形状、不含聊天正文，查完删掉。见 ./skipDiagnostics。
@@ -2102,7 +2105,23 @@ export const amsgHooks = {
       await recordSkip(ctx, charId, 'daily-limit', occurrenceMs, taskBrief);
       return { skip: true } as const;
     }
-
+    
+    {
+      const gate = await decideGate({
+        instant,
+        isWatch: isWatchTask(
+          taskMeta.amsgTaskInstruction,
+          (taskBrief as { promptHint?: unknown } | null | undefined)?.promptHint,
+        ),
+        occurrenceMs,
+        nowMs,
+        lastUserMessageAt,
+      });
+      console.log('[amsg:gate]', { taskId: ctx.task.id, ...gate });
+      if (gate.kind === 'defer') return { defer: { afterMs: gate.afterMs } } as const;
+      if (gate.kind === 'skip') return { skip: true } as const;
+    }
+    
     // 客户端记录的（打包那一刻的快照）+ 角色自己在之前几次 fire 里排下、客户端还没认领的。
     // 后者不补上的话，角色排完一条、下次到点又看不见它，很容易把同一件事再排一遍。
     const livePendingTasks = [...pack.pendingTasks, ...selfLog.tasks];
@@ -2856,6 +2875,7 @@ export const buildWorkerConfig = (env: Env) => {
     : null);
   // 跳过诊断要不要带原文片段，跟着面板上那个变量走（见 ./skipDiagnostics）。
   configureSkipDiagnostics({ rawExcerpt: isDebugFlagOn(env.AMSG_DEBUG_LLM_RAW) });
+  configureTriggerGate(env);
   return {
     // db 缺省时 factory 自动用 createD1Adapter(env.DB)
     masterKey: env.AMSG_MASTER_KEY,
