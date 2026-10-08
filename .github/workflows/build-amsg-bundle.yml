@@ -1,0 +1,47 @@
+name: Build amsg worker bundle (trigger-gate)
+
+# 构建带触发闸的 Worker 成品包，给手动粘贴到 Cloudflare 面板用。
+# 跑完在这次运行页面底部 Artifacts 下载 amsg-worker-bundle。
+on:
+  push:
+    branches: [trigger-gate]
+    paths:
+      - 'worker/**'
+      - 'utils/**'
+      - 'types.ts'
+      - '.github/workflows/build-amsg-bundle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build:workers
+
+      - name: Check the trigger gate is inside the bundle
+        run: |
+          grep -q "watch-window-over" worker/amsg/worker.bundle.js || {
+            echo "bundle 里没有触发闸代码：index.ts 的 4 处改动可能还没提交。"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amsg-worker-bundle
+          path: worker/amsg/worker.bundle.js
