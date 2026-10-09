@@ -197,7 +197,7 @@ import { buildTickReport, readOverdueTasks, recordTickOutcome, type TickReportDb
 import type { ActiveMsg2TaskRecord } from '../../../types';
 import { createHybridPushTransport, isFcmConfigured, type NativeFcmEnv } from './nativeFcm';
 import { configureSkipDiagnostics, isDebugFlagOn, logSkipDiagnostic } from './skipDiagnostics';
-import { configureTriggerGate, decideGate, isWatchTask } from './triggerGate';
+import { configureTriggerGate, decideGate, isWatchTask, takeGateNote } from './triggerGate';
 
 interface Env extends NativeFcmEnv {
   AMSG_MASTER_KEY: string;
@@ -2116,6 +2116,7 @@ export const amsgHooks = {
         occurrenceMs,
         nowMs,
         lastUserMessageAt,
+        taskId: String(ctx.task.id ?? ''),
       });
       console.log('[amsg:gate]', { taskId: ctx.task.id, ...gate });
       if (gate.kind === 'defer') return { defer: { afterMs: gate.afterMs } } as const;
@@ -2385,7 +2386,7 @@ export const amsgHooks = {
       // 「此刻在做什么」里的钟点跟今日节日同一个开关：关掉时间感知的角色不该从日程块
       // 读到「23:00」——那正是这个开关要挡的东西。日程内容本身照给。
       includeClock: toolPack.timeAwarenessEnabled,
-    }), userHoliday) + mcpBlock + scheduleBlock;
+    }), userHoliday) + mcpBlock + scheduleBlock + takeGateNote(String(ctx.task.id ?? ''));
     return {
       messages: [{ role: 'user' as const, content: prompt }],
       ...common,
