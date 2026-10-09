@@ -7,6 +7,9 @@
  *   起床后再发。这里**只能 defer，不能 skip**——skip 会把一次性任务消费掉。
  * - 没配 TRIGGER_URL / TRIGGER_TOKEN：完全不介入，行为和以前一样。
  *
+ * 守望任务放行时，服务会说明"为什么该找他"（失联多久、念头、之前几次没回），
+ * 这里把它整理成一小段提示，等 onBeforeFire 拼提示词时用 takeGateNote(taskId) 取走，让 TA 知道为什么想找他。
+ *
  * 判断服务连不上时：守望任务推迟（到窗口结束自然放弃），普通任务最多多等 15 分钟就放行，
  * 绝不让早安因为服务挂了而丢。
  */
@@ -35,7 +38,15 @@ export const configureTriggerGate = (env: { TRIGGER_URL?: string; TRIGGER_TOKEN?
 export const isWatchTask = (...texts: Array<unknown>): boolean =>
   texts.some((t) => typeof t === 'string' && t.includes(WATCH_MARK));
 
-type Answer = { ok: true; yes: boolean; reason: string } | { ok: false };
+type GateInfo = {
+  reason: string;
+  unanswered: number;
+  gapHours: number | null;
+  localHour: number | null;
+  missedMeal: boolean;
+  openItems: string[];
+};
+type Answer = { ok: true; yes: boolean; info: GateInfo } | { ok: false };
 
 const ask = async (endpoint: '/gate' | '/allow', lastUserMessageAt: number | null): Promise<Answer> => {
   if (!cfg) return { ok: false };
@@ -49,13 +60,72 @@ const ask = async (endpoint: '/gate' | '/allow', lastUserMessageAt: number | nul
       signal: ctrl.signal,
     });
     if (!res.ok) return { ok: false };
-    const j = (await res.json()) as { fire?: unknown; allow?: unknown; reason?: unknown };
-    return { ok: true, yes: j.fire === true || j.allow === true, reason: typeof j.reason === 'string' ? j.reason : '' };
+    const j = (await res.json()) as {
+      fire?: unknown;
+      allow?: unknown;
+      reason?: unknown;
+      unanswered?: unknown;
+      context?: { gapHours?: unknown; localHour?: unknown; missedMeal?: unknown; openItems?: unknown } | null;
+    };
+    const c = j.context ?? {};
+    return {
+      ok: true,
+      yes: j.fire === true || j.allow === true,
+      info: {
+        reason: typeof j.reason === 'string' ? j.reason : '',
+        unanswered: typeof j.unanswered === 'number' ? j.unanswered : 0,
+        gapHours: typeof c.gapHours === 'number' ? c.gapHours : null,
+        localHour: typeof c.localHour === 'number' ? c.localHour : null,
+        missedMeal: c.missedMeal === true,
+        openItems: Array.isArray(c.openItems)
+          ? c.openItems.filter((x): x is string => typeof x === 'string').slice(0, 5)
+          : [],
+      },
+    };
   } catch {
     return { ok: false };
   } finally {
     clearTimeout(timer);
   }
+};
+
+/** 把服务给的"为什么该找他"整理成一小段提示，接在提示词末尾。没有可说的就返回空串。 */
+const buildNote = (i: GateInfo): string => {
+  const lines: string[] = [];
+  if (i.reason === 'long-silence') {
+    lines.push(
+      i.gapHours !== null
+        ? `他已经大约 ${i.gapHours} 小时没有消息、也没见到他的动静了${i.missedMeal ? '，中间还错过了饭点' : ''}。`
+        : '他已经很久没有消息了。',
+    );
+  } else if (i.reason === 'late-night-active') {
+    lines.push('这么晚了，他的手机或电脑还一直有动静，像是还没睡。');
+  } else if (i.reason === 'overflow') {
+    lines.push('你这阵子一直惦记着他，想他的念头攒满了。');
+  }
+  if (i.localHour !== null) lines.push(`他那边现在大约是 ${i.localHour} 点。`);
+  if (i.openItems.length) lines.push(`你心里还挂着这些事：${i.openItems.join('；')}。`);
+  if (i.unanswered > 0) {
+    lines.push(`你之前已经主动找过他 ${i.unanswered} 次，他都还没回。这次语气收着点，别追问，也别重复上次说过的话。`);
+  }
+  if (!lines.length) return '';
+  return `\n\n【这次你为什么想找他（只供你参考）】\n${lines.map((l) => `- ${l}`).join('\n')}\n请自然地把这份心情带进你要说的话里；不要提"系统""判断""阈值"这类词，也不要把上面的话原样念出来。`;
+};
+
+const NOTE_TTL_MS = 10 * 60_000;
+const notes = new Map<string, { text: string; at: number }>();
+
+const rememberNote = (taskId: string, text: string, nowMs: number): void => {
+  for (const [k, v] of notes) if (nowMs - v.at > NOTE_TTL_MS) notes.delete(k);
+  if (taskId && text) notes.set(taskId, { text, at: nowMs });
+  else if (taskId) notes.delete(taskId);
+};
+
+/** 取走（并清掉）这个任务本次放行时留下的"为什么找他"提示；没有就是空串。拼提示词时接在末尾。 */
+export const takeGateNote = (taskId: string): string => {
+  const n = notes.get(taskId);
+  notes.delete(taskId);
+  return n && Date.now() - n.at < NOTE_TTL_MS ? n.text : '';
 };
 
 export type GateAction =
@@ -69,6 +139,8 @@ export const decideGate = async (opts: {
   occurrenceMs: number;
   nowMs: number;
   lastUserMessageAt: number | null;
+  /** 任务 id，用来把"为什么找他"的提示交给后面拼提示词的地方。 */
+  taskId?: string;
 }): Promise<GateAction> => {
   if (!cfg) return { kind: 'pass', why: 'gate-off' };
   if (opts.instant) return { kind: 'pass', why: 'instant' };
@@ -78,9 +150,11 @@ export const decideGate = async (opts: {
     if (waited > WATCH_WINDOW_MS) return { kind: 'skip', why: 'watch-window-over' };
     const a = await ask('/gate', opts.lastUserMessageAt);
     if (!a.ok) return { kind: 'defer', afterMs: GATE_DEFER_MS, why: 'gate-down' };
-    return a.yes
-      ? { kind: 'pass', why: `watch:${a.reason}` }
-      : { kind: 'defer', afterMs: GATE_DEFER_MS, why: `watch-wait:${a.reason}` };
+    if (a.yes) {
+      rememberNote(opts.taskId ?? '', buildNote(a.info), opts.nowMs);
+      return { kind: 'pass', why: `watch:${a.info.reason}` };
+    }
+    return { kind: 'defer', afterMs: GATE_DEFER_MS, why: `watch-wait:${a.info.reason}` };
   }
 
   const a = await ask('/allow', opts.lastUserMessageAt);
@@ -91,6 +165,6 @@ export const decideGate = async (opts: {
   }
   if (a.yes) return { kind: 'pass', why: 'allow' };
   return waited > ALLOW_MAX_HOLD_MS
-    ? { kind: 'pass', why: `allow-max-hold:${a.reason}` }
-    : { kind: 'defer', afterMs: GATE_DEFER_MS, why: `allow-wait:${a.reason}` };
+    ? { kind: 'pass', why: `allow-max-hold:${a.info.reason}` }
+    : { kind: 'defer', afterMs: GATE_DEFER_MS, why: `allow-wait:${a.info.reason}` };
 };
