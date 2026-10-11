@@ -29,6 +29,8 @@ const CFG = {
   jitter: +(env.JITTER || 0.25),                // 阈值随机抖动 ±25%
   itemTtlH: +(env.ITEM_TTL_H || 72),            // 念头多久没被提起就自己淡掉
   maxAiItems: +(env.MAX_AI_ITEMS || 8),         // TA 自己最多同时记几条
+  wakeMinGapMin: +(env.WAKE_MIN_GAP_MIN || 20), // 两次醒来至少隔多久（防起点任务和链撞在同一格）
+  maxWakesPerDay: +(env.MAX_WAKES_PER_DAY || 40), // 一天最多醒几次（每次醒来都可能调一次模型）
 };
 
 const FILE = path.join(env.DATA_DIR || './data', 'state.json');
@@ -124,6 +126,28 @@ export function decide(now, commit) {
 }
 
 // 早安等普通任务用：只看"在睡觉 / 刚聊完"，不记账、不管失联和心绪。
+// 心跳醒来用：只做熔断（刚聊完 / 睡觉 / 深夜没动静 / 醒得太密 / 当天醒太多次），说不说由角色自己定。
+export function wake(now, commit, unanswered) {
+  const t = local(now);
+  const items = liveItems(now);
+  const act = (arr, min) => arr.filter((x) => now - x < min * MIN).length;
+  const no = (reason) => ({ wake: false, reason });
+  if (S.lastChat && (now - S.lastChat) / MIN < CFG.chatCooldownMin) return no('fuse:post-chat-cooldown');
+  if (S.sleeping && now - S.sleepAt < 12 * HOUR) return no('fuse:sleeping');
+  if (inWin(t.min, CFG.nightStart, CFG.nightEnd) && act(S.phoneActs, 20) + act(S.pcActs, 20) === 0) return no('fuse:night-quiet');
+  if (S.lastWake && (now - S.lastWake) / MIN < CFG.wakeMinGapMin) return no('fuse:wake-gap');
+  const wakes = S.wakes?.day === t.day ? S.wakes.n : 0;
+  if (wakes >= CFG.maxWakesPerDay) return no('fuse:wake-daily-cap');
+  const seen = Math.max(S.lastChat, S.lastAct);
+  const gapMin = seen ? (now - seen) / MIN : 0;
+  const mealBetween = seen && (gapMin >= 1440 || CFG.meals.some((m) => (m - local(seen).min + 1440) % 1440 < gapMin));
+  if (commit) { S.lastWake = now; S.wakes = { day: t.day, n: wakes + 1 }; save(); }
+  return {
+    wake: true, reason: 'wake', unanswered: Number.isFinite(unanswered) ? unanswered : S.unanswered,
+    context: { gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, openItems: items.map((i) => i.text) },
+  };
+}
+
 export function allow(now) {
   if (S.sleeping && now - S.sleepAt < 12 * HOUR) return { allow: false, reason: 'sleeping' };
   if (S.lastChat && (now - S.lastChat) / MIN < CFG.chatActiveMin) return { allow: false, reason: 'in-chat' };
@@ -189,10 +213,10 @@ const server = http.createServer(async (req, res) => {
     return send(200, Array.isArray(raw) ? out : out[0]);
   }
   if (parts[0] === 'event' && req.method === 'POST') return event(parts[1], u.searchParams, now) ? send(200, { ok: true }) : send(404, { error: 'unknown event' });
-  if ((parts[0] === 'gate' || parts[0] === 'allow') && req.method === 'POST') {
+  if ((parts[0] === 'gate' || parts[0] === 'allow' || parts[0] === 'wake') && req.method === 'POST') {
     const b = await readBody(req);
     syncChat(+b.lastUserMessageAt, now);
-    return send(200, parts[0] === 'gate' ? decide(now, true) : allow(now));
+    return send(200, parts[0] === 'gate' ? decide(now, true) : parts[0] === 'wake' ? wake(now, true, +b.unanswered) : allow(now));
   }
   if (parts[0] === 'status') return send(200, { ...decide(now, false), allow: allow(now), items: liveItems(now), sleeping: S.sleeping, lastChat: S.lastChat, lastAct: S.lastAct, lastFire: S.lastFire });
   if (parts[0] === 'item' && req.method === 'POST') {

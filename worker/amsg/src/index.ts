@@ -197,7 +197,17 @@ import { buildTickReport, readOverdueTasks, recordTickOutcome, type TickReportDb
 import type { ActiveMsg2TaskRecord } from '../../../types';
 import { createHybridPushTransport, isFcmConfigured, type NativeFcmEnv } from './nativeFcm';
 import { configureSkipDiagnostics, isDebugFlagOn, logSkipDiagnostic } from './skipDiagnostics';
-import { configureTriggerGate, decideGate, isWatchTask, takeGateNote } from './triggerGate';
+import {
+  configureTriggerGate,
+  decideGate,
+  flagHeartbeat,
+  heartbeatInstruction,
+  isHeartbeatTask,
+  isSilentHeartbeat,
+  isWatchTask,
+  scheduleNextHeartbeat,
+  takeGateNote,
+} from './triggerGate';
 
 interface Env extends NativeFcmEnv {
   AMSG_MASTER_KEY: string;
@@ -2049,6 +2059,24 @@ export const amsgHooks = {
       return { skip: true } as const;
     }
 
+    // 心跳：先把 30 分钟后的下一次排好（这一轮沉默、跳过、失败，链都不会断），再往下走各道闸。
+    // 放在"关了主动消息 2.0"那道跳过之后：用户关掉 2.0 就不再续链。
+    const isHb = !instant && isHeartbeatTask(
+      taskMeta.amsgTaskInstruction,
+      (taskBrief as { promptHint?: unknown } | null | undefined)?.promptHint,
+    );
+    if (isHb) {
+      const hbNext = await scheduleNextHeartbeat({
+        scheduleTask: ctx.scheduleTask,
+        charId,
+        occurrenceMs,
+        nowMs,
+        tzId: pack.tzId,
+        instruction: taskMeta.amsgTaskInstruction,
+      });
+      console.log('[amsg:heartbeat]', { taskId: ctx.task.id, next: hbNext });
+    }
+
     const maxUnansweredSends = limits.maxUnansweredSends;
     if (!instant && selfScheduled
       && countUnansweredSends(selfLog) >= maxUnansweredSends) {
@@ -2117,10 +2145,13 @@ export const amsgHooks = {
         nowMs,
         lastUserMessageAt,
         taskId: String(ctx.task.id ?? ''),
+        isHeartbeat: isHb,
+        unansweredSends: countUnansweredSends(selfLog),
       });
       console.log('[amsg:gate]', { taskId: ctx.task.id, ...gate });
       if (gate.kind === 'defer') return { defer: { afterMs: gate.afterMs } } as const;
       if (gate.kind === 'skip') return { skip: true } as const;
+      if (isHb && gate.kind === 'pass') flagHeartbeat(ctx.scratch);
     }
     
     // 客户端记录的（打包那一刻的快照）+ 角色自己在之前几次 fire 里排下、客户端还没认领的。
@@ -2377,7 +2408,7 @@ export const amsgHooks = {
 
     // fire_pack v3：「本次任务」指令随任务 metadata 走，这里填槽。
     // MCP 块拼在渲染好的 prompt 之后（同一条 user 消息）。
-    const prompt = insertUserHolidayInProfile(renderFirePack(pack, ctx.now.getTime(), taskMeta.amsgTaskInstruction as string, {
+    const prompt = insertUserHolidayInProfile(renderFirePack(pack, ctx.now.getTime(), (isHb ? heartbeatInstruction() : taskMeta.amsgTaskInstruction) as string, {
       maxUnansweredSends,
       selfLog,
       taskListBlock,
@@ -2408,6 +2439,11 @@ export const amsgHooks = {
     }
 
     const content = stripReasoningTags(ctx.llmOutputText || '').trim();
+
+    // 心跳那一轮里角色只回了 [沉默]：这一轮不发（下一次已经排好了）。
+    if (isSilentHeartbeat(ctx.scratch, content)) {
+      return { decision: 'skip-push', reason: 'heartbeat-silent' } as const;
+    }
 
     // 任务身份直接从 ctx 上读（sessionId 是给日志和去重用的不透明串，不拿它切）。
     const taskId = ctx.taskId != null ? String(ctx.taskId) : null;

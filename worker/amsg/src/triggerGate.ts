@@ -48,7 +48,11 @@ type GateInfo = {
 };
 type Answer = { ok: true; yes: boolean; info: GateInfo } | { ok: false };
 
-const ask = async (endpoint: '/gate' | '/allow', lastUserMessageAt: number | null): Promise<Answer> => {
+const ask = async (
+  endpoint: '/gate' | '/allow' | '/wake',
+  lastUserMessageAt: number | null,
+  unanswered?: number,
+): Promise<Answer> => {
   if (!cfg) return { ok: false };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
@@ -56,13 +60,14 @@ const ask = async (endpoint: '/gate' | '/allow', lastUserMessageAt: number | nul
     const res = await fetch(`${cfg.url}${endpoint}`, {
       method: 'POST',
       headers: { 'X-Token': cfg.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ lastUserMessageAt }),
+      body: JSON.stringify({ lastUserMessageAt, ...(typeof unanswered === 'number' ? { unanswered } : {}) }),
       signal: ctrl.signal,
     });
     if (!res.ok) return { ok: false };
     const j = (await res.json()) as {
       fire?: unknown;
       allow?: unknown;
+      wake?: unknown;
       reason?: unknown;
       unanswered?: unknown;
       context?: { gapHours?: unknown; localHour?: unknown; missedMeal?: unknown; openItems?: unknown } | null;
@@ -70,7 +75,7 @@ const ask = async (endpoint: '/gate' | '/allow', lastUserMessageAt: number | nul
     const c = j.context ?? {};
     return {
       ok: true,
-      yes: j.fire === true || j.allow === true,
+      yes: j.fire === true || j.allow === true || j.wake === true,
       info: {
         reason: typeof j.reason === 'string' ? j.reason : '',
         unanswered: typeof j.unanswered === 'number' ? j.unanswered : 0,
@@ -100,6 +105,10 @@ const buildNote = (i: GateInfo): string => {
     );
   } else if (i.reason === 'late-night-active') {
     lines.push('这么晚了，他的手机或电脑还一直有动静，像是还没睡。');
+  } else if (i.reason === 'wake') {
+    if (i.gapHours !== null && i.gapHours >= 1) {
+      lines.push(`距离他上次出现已经大约 ${i.gapHours} 小时${i.missedMeal ? '，中间还错过了饭点' : ''}。`);
+    }
   } else if (i.reason === 'overflow') {
     lines.push('你这阵子一直惦记着他，想他的念头攒满了。');
   }
@@ -141,10 +150,23 @@ export const decideGate = async (opts: {
   lastUserMessageAt: number | null;
   /** 任务 id，用来把"为什么找他"的提示交给后面拼提示词的地方。 */
   taskId?: string;
+  /** 心跳任务：问 /wake（只做睡觉 / 刚聊完 / 深夜这类熔断，说不说由角色自己定）。 */
+  isHeartbeat?: boolean;
+  /** 角色已经主动找过他几次、他都没回（让提示词收着点）。 */
+  unansweredSends?: number;
 }): Promise<GateAction> => {
   if (!cfg) return { kind: 'pass', why: 'gate-off' };
   if (opts.instant) return { kind: 'pass', why: 'instant' };
   const waited = opts.nowMs - opts.occurrenceMs;
+
+  if (opts.isHeartbeat) {
+    // 下一次已经排好了，所以这里放心 skip；服务连不上就不醒（宁可少醒，也别半夜盲调模型）。
+    const a = await ask('/wake', opts.lastUserMessageAt, opts.unansweredSends);
+    if (!a.ok) return { kind: 'skip', why: 'wake-gate-down' };
+    if (!a.yes) return { kind: 'skip', why: `wake-skip:${a.info.reason}` };
+    rememberNote(opts.taskId ?? '', buildNote(a.info), opts.nowMs);
+    return { kind: 'pass', why: 'wake' };
+  }
 
   if (opts.isWatch) {
     if (waited > WATCH_WINDOW_MS) return { kind: 'skip', why: 'watch-window-over' };
@@ -168,3 +190,91 @@ export const decideGate = async (opts: {
     ? { kind: 'pass', why: `allow-max-hold:${a.info.reason}` }
     : { kind: 'defer', afterMs: GATE_DEFER_MS, why: `allow-wait:${a.info.reason}` };
 };
+
+// ───────────────────────── 心跳链 ─────────────────────────
+// 起点任务（每天重复、补充灵感里写 [心跳]）到点 → 先排好 30 分钟后的下一次（链不断）→ 问 Zeabur /wake
+// 做熔断预检（不调模型）→ 过了才让角色自己决定说不说。回复 [沉默] = 这一轮什么都不发。
+
+export const HEARTBEAT_MARK = '[心跳]';
+/** 每隔多久醒一次。 */
+export const HEARTBEAT_EVERY_MS = 30 * 60_000;
+/** 排下一次时离现在至少多远（上游不收"时间太近"的排程）。 */
+const HEARTBEAT_MIN_LEAD_MS = 5 * 60_000;
+
+export const isHeartbeatTask = (...texts: Array<unknown>): boolean =>
+  texts.some((t) => typeof t === 'string' && t.includes(HEARTBEAT_MARK));
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyFn = (...args: any[]) => any;
+
+/** 同一个角色、同一个时刻永远得到同一个 uuid：重跑、起点任务和链同时排同一格，都只会建出一条。 */
+const hbUuid = async (charId: string, slotMs: number): Promise<string> => {
+  const d = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`hb|${charId}|${slotMs}`)));
+  d[6] = (d[6] & 0x0f) | 0x40;
+  d[8] = (d[8] & 0x3f) | 0x80;
+  const h = Array.from(d.slice(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+};
+
+/** 排下一次心跳（落在每 30 分钟的整点/半点格子上）。返回一句话结果，只用来打日志。 */
+export const scheduleNextHeartbeat = async (a: {
+  scheduleTask: AnyFn | undefined;
+  charId: string;
+  occurrenceMs: number;
+  nowMs: number;
+  tzId: string;
+  instruction: unknown;
+}): Promise<string> => {
+  if (!cfg) return 'gate-off';
+  if (typeof a.scheduleTask !== 'function') return 'no-schedule-api';
+  const slot =
+    Math.ceil(Math.max(a.occurrenceMs + HEARTBEAT_EVERY_MS, a.nowMs + HEARTBEAT_MIN_LEAD_MS) / HEARTBEAT_EVERY_MS) *
+    HEARTBEAT_EVERY_MS;
+  const iso = new Date(slot).toISOString();
+  const uuid = await hbUuid(a.charId, slot);
+  const base = typeof a.instruction === 'string' ? a.instruction : '';
+  try {
+    const r = await a.scheduleTask({
+      firstSendTime: iso,
+      recurrenceType: 'none',
+      messageType: 'auto',
+      uuid,
+      tzId: a.tzId,
+      metadata: {
+        charId: a.charId,
+        source: 'active_msg_2',
+        amsgMode: 'auto',
+        amsgClientTaskId: `${uuid}-c`,
+        amsgExpirePolicy: 'expire',
+        amsgTaskInstruction: base.includes(HEARTBEAT_MARK) ? base : `${base}\n${HEARTBEAT_MARK}`.trim(),
+        amsgSelfScheduled: true,
+      },
+    });
+    return r && r.created === false ? `exists:${iso}` : `scheduled:${iso}`;
+  } catch (e) {
+    return `failed:${e instanceof Error ? e.message : String(e)}`.slice(0, 160);
+  }
+};
+
+/** 心跳醒来时放进"本次任务"槽位的话：替掉"请发一条消息"那种口吻，让角色自己决定。 */
+export const heartbeatInstruction = (): string =>
+  [
+    '这是一次例行的醒来，不是谁在催你发消息。你自己决定要不要做点什么：',
+    '- 想主动跟他说点什么，就直接写出来，像平时那样说话；',
+    '- 想先做点事（看看他的动静、记下惦记的事、查点东西），就去做；',
+    '- 现在没什么想说的，或者不该打扰他，就只回复 [沉默]，这一轮什么都不会发出去。',
+    '别因为"到点了"硬凑一句；说了之后他还没回，就不要重复同样的话。不要提"心跳""例行醒来""系统"这些词。',
+  ].join('\n');
+
+const HB_SCRATCH_KEY = '__heartbeat';
+
+/** 放行后在这一次 fire 的 scratch 上做个记号，onLLMOutput 靠它认出"这是心跳那一轮"。 */
+export const flagHeartbeat = (scratch: Record<string, unknown> | undefined): void => {
+  if (scratch) scratch[HB_SCRATCH_KEY] = true;
+};
+
+const SILENT_RE = /^[\[【(（]\s*沉默\s*[\]】)）][。.!！\s]*$/;
+
+/** 心跳那一轮里，角色只回了 [沉默]：这一轮不发。 */
+export const isSilentHeartbeat = (scratch: Record<string, unknown> | undefined, content: string): boolean =>
+  scratch?.[HB_SCRATCH_KEY] === true && SILENT_RE.test(content.trim());
