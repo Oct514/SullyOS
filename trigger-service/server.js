@@ -5,6 +5,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { handleRpc } from './mcp.js';
 
 const env = process.env;
 const TOKEN = env.TOKEN;
@@ -26,6 +27,8 @@ const CFG = {
   missRate: +(env.MISS_RATE || 12),             // 心绪值每小时增长
   threshold: +(env.THRESHOLD || 100),
   jitter: +(env.JITTER || 0.25),                // 阈值随机抖动 ±25%
+  itemTtlH: +(env.ITEM_TTL_H || 72),            // 念头多久没被提起就自己淡掉
+  maxAiItems: +(env.MAX_AI_ITEMS || 8),         // TA 自己最多同时记几条
 };
 
 const FILE = path.join(env.DATA_DIR || './data', 'state.json');
@@ -54,6 +57,9 @@ const local = (ts) => {
 const inWin = (x, s, e) => (s <= e ? x >= s && x < e : x >= s || x < e);
 const MIN = 60000, HOUR = 3600000;
 
+// 还有效的念头：超过 itemTtlH 小时的自动淡掉；没有时间戳的老数据从现在起算。
+const liveItems = (now) => S.items.filter((i) => now - (i.at ??= now) < CFG.itemTtlH * HOUR);
+
 // 用户最后一次开口的时间（Worker 带来的）。比已知的新 = 他刚聊过：清零"没人理"和心绪。
 function syncChat(ts, now) {
   if (!Number.isFinite(ts) || ts <= 0 || ts > now + MIN) return;
@@ -70,11 +76,12 @@ export function decide(now, commit) {
   const back = 1 + S.unanswered;                       // 没人理就越来越克制
   const dtH = Math.min((now - S.missAt) / HOUR, 6);
   const miss = S.miss + CFG.missRate * dtH;
-  const itemsW = S.items.reduce((a, i) => a + i.weight, 0);
+  const items = liveItems(now);
+  const itemsW = items.reduce((a, i) => a + i.weight, 0);
   const eff = miss + itemsW;
   const thr = S.threshold * back;
   const base = { miss: Math.round(eff), threshold: Math.round(thr), unanswered: S.unanswered };
-  if (commit) { S.miss = miss; S.missAt = now; }
+  if (commit) { S.miss = miss; S.missAt = now; S.items = items; }
   const no = (reason) => ({ fire: false, reason, ...base });
 
   // —— 硬熔断 ——
@@ -103,12 +110,14 @@ export function decide(now, commit) {
 
   const ctx = {
     gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween,
-    openItems: S.items.map((i) => i.text),
+    openItems: items.map((i) => i.text),
   };
   if (commit) {
     S.lastFire = now; S.miss = 0; S.missAt = now; S.unanswered++;
     S.threshold = CFG.threshold * (1 + CFG.jitter * (Math.random() * 2 - 1));
     S.fires = { day: t.day, n: fires + 1 };
+    // TA 自己记的念头：这次说过了就淡一半，淡到很轻就不再算；你手动加的保持不变。
+    S.items = S.items.map((i) => (i.src === 'ai' ? { ...i, weight: Math.floor(i.weight / 2) } : i)).filter((i) => i.weight >= 3);
     save();
   }
   return { fire: true, reason, context: ctx, ...base };
@@ -135,31 +144,62 @@ function event(type, q, now) {
   return true;
 }
 
+// 给 MCP 工具用的念头池接口（TA 自己记 / 划掉 / 看）。
+const mcpApi = {
+  add(text, weight) {
+    const now = Date.now(), items = liveItems(now), t = text.slice(0, 200);
+    const w = Math.min(Math.max(Math.trunc(+weight) || 15, 5), 25);
+    const dup = items.find((i) => i.text === t);
+    if (dup) { dup.weight = Math.max(dup.weight, w); dup.at = now; S.items = items; save(); return { item: dup }; }
+    if (items.filter((i) => i.src === 'ai').length >= CFG.maxAiItems) return { full: true, max: CFG.maxAiItems, items };
+    const item = { id: S.seq++, text: t, weight: w, at: now, src: 'ai' };
+    S.items = [...items, item]; save(); return { item };
+  },
+  done(id) { const n = S.items.length; S.items = S.items.filter((i) => i.id !== id); save(); return S.items.length < n; },
+  list() { return liveItems(Date.now()); },
+};
+
 const readBody = (req) => new Promise((ok) => {
   let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => { try { ok(JSON.parse(b || '{}')); } catch { ok({}); } });
 });
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
-  const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const cors = {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
+    'access-control-allow-headers': 'content-type,authorization,x-token,accept,mcp-session-id,mcp-protocol-version',
+    'access-control-expose-headers': 'Mcp-Session-Id',
+  };
+  const send = (code, obj) => { res.writeHead(code, { ...cors, 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
   if (u.pathname === '/') return send(200, { ok: true });
-  const tok = req.headers['x-token'] || u.searchParams.get('token');
+  const bearer = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '')?.[1];
+  const tok = req.headers['x-token'] || bearer || u.searchParams.get('token');
   if (tok !== TOKEN) return send(401, { error: 'unauthorized' });
   const now = Date.now();
   const parts = u.pathname.split('/').filter(Boolean);
 
+  if (parts[0] === 'mcp') {
+    if (req.method !== 'POST') { res.writeHead(405, { ...cors, allow: 'POST' }); return res.end(); }
+    const raw = await readBody(req);
+    const msgs = Array.isArray(raw) ? raw : [raw];
+    const out = msgs.map((m) => handleRpc(m, mcpApi)).filter(Boolean);
+    if (!out.length) { res.writeHead(202, cors); return res.end(); }
+    return send(200, Array.isArray(raw) ? out : out[0]);
+  }
   if (parts[0] === 'event' && req.method === 'POST') return event(parts[1], u.searchParams, now) ? send(200, { ok: true }) : send(404, { error: 'unknown event' });
   if ((parts[0] === 'gate' || parts[0] === 'allow') && req.method === 'POST') {
     const b = await readBody(req);
     syncChat(+b.lastUserMessageAt, now);
     return send(200, parts[0] === 'gate' ? decide(now, true) : allow(now));
   }
-  if (parts[0] === 'status') return send(200, { ...decide(now, false), allow: allow(now), items: S.items, sleeping: S.sleeping, lastChat: S.lastChat, lastAct: S.lastAct, lastFire: S.lastFire });
+  if (parts[0] === 'status') return send(200, { ...decide(now, false), allow: allow(now), items: liveItems(now), sleeping: S.sleeping, lastChat: S.lastChat, lastAct: S.lastAct, lastFire: S.lastFire });
   if (parts[0] === 'item' && req.method === 'POST') {
     const b = await readBody(req);
     if (parts[1] === 'done') { S.items = S.items.filter((i) => i.id !== b.id); save(); return send(200, { ok: true }); }
     if (!b.text) return send(400, { error: 'text required' });
-    const item = { id: S.seq++, text: String(b.text).slice(0, 200), weight: Math.min(Math.max(+b.weight || 10, 1), 60) };
+    const item = { id: S.seq++, text: String(b.text).slice(0, 200), weight: Math.min(Math.max(+b.weight || 10, 1), 60), at: now, src: 'manual' };
     S.items.push(item); save(); return send(200, item);
   }
   send(404, { error: 'not found' });
