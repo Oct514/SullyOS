@@ -1,5 +1,6 @@
 import React from 'react';
 import { AppConfig, AppID } from './types';
+import { IMAGEGEN_APP_ID } from './utils/imageGenAppId';
 import {
   UserCircle,
   IdentificationCard,
@@ -7,6 +8,7 @@ import {
   UsersThree,
   GearSix,
   Images,
+  ImageSquare,
   PaintBrush,
   Palette,
   Heart,
@@ -46,6 +48,7 @@ export const Icons: Record<string, React.FC<{ className?: string }>> = {
   GroupChat: ({ className }) => <UsersThree className={className} weight="regular" />,
   Settings: ({ className }) => <GearSix className={className} weight="regular" />,
   Gallery: ({ className }) => <Images className={className} weight="regular" />,
+  ImageGen: ({ className }) => <ImageSquare className={className} weight="regular" />,
   ThemeMaker: ({ className }) => <PaintBrush className={className} weight="regular" />,
   Appearance: ({ className }) => <Palette className={className} weight="regular" />,
   Date: ({ className }) => <Heart className={className} weight="regular" />,
@@ -105,6 +108,7 @@ export const INSTALLED_APPS: AppConfig[] = [
   { id: AppID.HotNews, name: '热点', icon: 'HotNews', color: 'red' },
   { id: AppID.FAQ, name: '使用帮助', icon: 'FAQ', color: 'indigo' },
   { id: AppID.Gallery, name: '相册', icon: 'Gallery', color: 'orange' },
+  { id: IMAGEGEN_APP_ID, name: '生图', icon: 'ImageGen', color: 'violet' },
   { id: AppID.XhsFreeRoam, name: '自由活动', icon: 'XhsFreeRoam', color: 'rose' },
   { id: AppID.XhsStock, name: '小红书图库', icon: 'XhsStock', color: 'red' },
   { id: AppID.Appearance, name: '外观', icon: 'Appearance', color: 'slate' },
