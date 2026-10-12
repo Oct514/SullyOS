@@ -82,13 +82,24 @@ export interface GenResult {
   blob?: Blob;
 }
 
+// 多角色：每个角色有自己的提示词、负面提示词、位置（5x5 格）和可选的参考图
+export interface CharSlot {
+  prompt: string;
+  uc: string;
+  auto: boolean; // true = 位置由 AI 自选
+  col: number; // 0~4
+  row: number; // 0~4
+  ref?: Blob;
+}
+
 export interface GenOptions {
   cfg: ImageGenConfig;
-  prompt: string;
+  prompt: string; // 单人时是完整提示词；多人时是整体/场景提示词
   negative: string;
   size: SizeKey;
   n: number;
-  refs: Blob[]; // 锁脸参考图；空数组 = 不锁脸
+  refs: Blob[]; // 单人锁脸参考图；空数组 = 不锁脸
+  characters?: CharSlot[]; // 非空 = 多人模式
   signal?: AbortSignal;
 }
 
@@ -103,6 +114,11 @@ const NAI_SIZES: Record<SizeKey, [number, number]> = {
   landscape: [1216, 832],
   square: [1024, 1024],
 };
+
+// NovelAI V4/V4.5 的 5x5 位置格：格子中心坐标为 0.1 / 0.3 / 0.5 / 0.7 / 0.9
+function gridCenter(col: number, row: number): { x: number; y: number } {
+  return { x: Number((0.1 + 0.2 * col).toFixed(1)), y: Number((0.1 + 0.2 * row).toFixed(1)) };
+}
 
 async function readError(res: Response): Promise<string> {
   const text = await res.text();
@@ -136,25 +152,57 @@ function blobToResult(blob: Blob): GenResult {
 const LOCK_PREFIX =
   'Use the provided reference image(s) as the exact identity of the character: keep the same face, facial features, hairstyle, hair color and eye color. ';
 
+function positionWords(c: CharSlot): string {
+  if (c.auto) return '';
+  const h = c.col <= 1 ? 'on the left' : c.col >= 3 ? 'on the right' : 'in the center';
+  return ` Position: ${h} of the frame.`;
+}
+
 async function generateOpenAI(o: GenOptions): Promise<GenResult[]> {
   const c = o.cfg.openai;
   if (!c.apiKey) throw new Error('先在右上角 ⚙️ 里填 OpenAI 兼容接口的 API Key');
   const base = c.baseUrl.replace(/\/+$/, '');
   const headers: Record<string, string> = { Authorization: `Bearer ${c.apiKey}` };
+
+  const chars = (o.characters ?? []).filter((x) => x.prompt.trim());
   let prompt = o.prompt;
-  if (o.negative.trim()) prompt += `\n\nAvoid: ${o.negative.trim()}`;
+  let refBlobs: Blob[] = o.refs;
+  let lockText = LOCK_PREFIX;
+
+  if (chars.length > 0) {
+    // 多人：每个角色写成一条，指定了参考图的就告诉模型“这个人用第 N 张参考图”
+    refBlobs = [];
+    const lines = chars.map((ch, i) => {
+      let refNote = '';
+      if (ch.ref) {
+        let idx = refBlobs.indexOf(ch.ref);
+        if (idx < 0) {
+          refBlobs.push(ch.ref);
+          idx = refBlobs.length - 1;
+        }
+        refNote = ` (this is the person in reference image ${idx + 1}: keep the same face, hairstyle and features)`;
+      }
+      return `- Character ${i + 1}${refNote}: ${ch.prompt.trim()}${positionWords(ch)}`;
+    });
+    prompt = `${o.prompt}\n\nThe image contains ${chars.length} separate characters:\n${lines.join('\n')}`;
+    lockText = refBlobs.length > 0 ? 'Each character that has a reference image must keep that reference image\'s identity. ' : '';
+    const avoid = [o.negative, ...chars.map((x) => x.uc)].map((s) => s.trim()).filter(Boolean).join('; ');
+    if (avoid) prompt += `\n\nAvoid: ${avoid}`;
+  } else if (o.negative.trim()) {
+    prompt += `\n\nAvoid: ${o.negative.trim()}`;
+  }
 
   let res: Response;
   try {
-    if (o.refs.length > 0) {
+    if (refBlobs.length > 0) {
       const fd = new FormData();
       fd.append('model', c.model);
-      fd.append('prompt', LOCK_PREFIX + prompt);
+      fd.append('prompt', lockText + prompt);
       fd.append('n', String(o.n));
       fd.append('size', OPENAI_SIZES[o.size]);
       if (c.quality !== 'auto') fd.append('quality', c.quality);
       if (c.highFidelity) fd.append('input_fidelity', 'high');
-      o.refs.forEach((b, i) => fd.append('image[]', b, `ref${i}.png`));
+      refBlobs.forEach((b, i) => fd.append('image[]', b, `ref${i}.png`));
       res = await fetch(`${base}/images/edits`, { method: 'POST', headers, body: fd, signal: o.signal });
     } else {
       const body: Record<string, unknown> = {
@@ -244,8 +292,30 @@ async function generateNovelAI(o: GenOptions): Promise<GenResult[]> {
   const base = c.baseUrl.replace(/\/+$/, '');
   const [width, height] = NAI_SIZES[o.size];
 
+  const chars = (o.characters ?? []).filter((x) => x.prompt.trim());
+  let refBlobs: Blob[] = o.refs;
+  if (chars.length > 0) {
+    const distinct = Array.from(new Set(chars.map((x) => x.ref).filter((r): r is Blob => !!r)));
+    // NovelAI 官方说明：多张角色参考会把几个人的脸混在一起，而不是分开对应
+    if (distinct.length > 1) {
+      throw new Error(
+        'NovelAI 官方说明：同时用多张角色参考会把几个人的脸混在一起，不会分开对应。请只给其中一个角色选参考图，或者改用 OpenAI 兼容接口。',
+      );
+    }
+    refBlobs = distinct;
+  }
+
   const refB64: string[] = [];
-  for (const b of o.refs) refB64.push(await toNaiReference(b));
+  for (const b of refBlobs) refB64.push(await toNaiReference(b));
+
+  // 角色提示词：结构参考 NekoAI 对 NovelAI 接口的封装（characterPrompts + v4_prompt.char_captions）
+  const charPrompts = chars.map((ch) => ({
+    prompt: ch.prompt.trim(),
+    uc: ch.uc.trim(),
+    center: ch.auto ? { x: 0.5, y: 0.5 } : gridCenter(ch.col, ch.row),
+    enabled: true,
+  }));
+  const useCoords = chars.some((ch) => !ch.auto);
 
   const out: GenResult[] = [];
   // NovelAI 一次请求只出一张，多张就循环发（每张不同 seed）
@@ -270,20 +340,26 @@ async function generateNovelAI(o: GenOptions): Promise<GenResult[]> {
       noise_schedule: 'karras',
       legacy_v3_extend: false,
       skip_cfg_above_sigma: null,
-      use_coords: false,
+      use_coords: useCoords,
       legacy_uc: false,
       normalize_reference_strength_multiple: true,
       inpaintImg2ImgStrength: 1,
       seed,
       negative_prompt: o.negative,
-      characterPrompts: [],
+      characterPrompts: charPrompts,
       v4_prompt: {
-        caption: { base_caption: o.prompt, char_captions: [] },
-        use_coords: false,
+        caption: {
+          base_caption: o.prompt,
+          char_captions: charPrompts.map((p) => ({ char_caption: p.prompt, centers: [p.center] })),
+        },
+        use_coords: useCoords,
         use_order: true,
       },
       v4_negative_prompt: {
-        caption: { base_caption: o.negative, char_captions: [] },
+        caption: {
+          base_caption: o.negative,
+          char_captions: charPrompts.map((p) => ({ char_caption: p.uc, centers: [p.center] })),
+        },
         legacy_uc: false,
       },
       deliberate_euler_ancestral_bug: false,
