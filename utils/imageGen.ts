@@ -1,8 +1,10 @@
 import JSZip from 'jszip';
+import type { Preset } from './imageGenStore';
 
 export type ImageGenProvider = 'openai' | 'novelai';
 export type SizeKey = 'portrait' | 'landscape' | 'square';
 
+// 两套设置完全独立。provider 只是「当前显示哪一套」的开关，不共享任何字段。
 export interface ImageGenConfig {
   provider: ImageGenProvider;
   openai: {
@@ -10,7 +12,8 @@ export interface ImageGenConfig {
     apiKey: string;
     model: string;
     quality: 'auto' | 'low' | 'medium' | 'high';
-    highFidelity: boolean; // 带参考图时请求 input_fidelity=high（更像参考图的脸）
+    highFidelity: boolean; // 带参考图时请求 input_fidelity=high
+    activePresetId: string;
   };
   novelai: {
     baseUrl: string;
@@ -19,12 +22,10 @@ export interface ImageGenConfig {
     steps: number;
     scale: number;
     sampler: string;
-    refStrength: number; // 角色参考强度 0~1
-    refFidelity: number; // 角色参考保真度 0~1
+    refStrength: number; // 角色参考（Precise Reference）Strength
+    refFidelity: number; // 角色参考 Fidelity
+    activePresetId: string;
   };
-  prefix: string; // 固定提示词前缀（画风/质量词）
-  suffix: string; // 固定提示词后缀
-  negativeDefault: string; // 默认负面提示词
 }
 
 export const DEFAULT_CONFIG: ImageGenConfig = {
@@ -35,6 +36,7 @@ export const DEFAULT_CONFIG: ImageGenConfig = {
     model: 'gpt-image-1',
     quality: 'auto',
     highFidelity: true,
+    activePresetId: '',
   },
   novelai: {
     baseUrl: 'https://image.novelai.net',
@@ -45,10 +47,8 @@ export const DEFAULT_CONFIG: ImageGenConfig = {
     sampler: 'k_euler_ancestral',
     refStrength: 1,
     refFidelity: 1,
+    activePresetId: '',
   },
-  prefix: '',
-  suffix: '',
-  negativeDefault: 'lowres, bad anatomy, bad hands, text, error, worst quality, jpeg artifacts',
 };
 
 const CFG_KEY = 'sullyos_imagegen_config_v1';
@@ -59,8 +59,7 @@ export function loadConfig(): ImageGenConfig {
     if (!raw) return DEFAULT_CONFIG;
     const p = JSON.parse(raw);
     return {
-      ...DEFAULT_CONFIG,
-      ...p,
+      provider: p.provider === 'novelai' ? 'novelai' : 'openai',
       openai: { ...DEFAULT_CONFIG.openai, ...(p.openai || {}) },
       novelai: { ...DEFAULT_CONFIG.novelai, ...(p.novelai || {}) },
     };
@@ -100,6 +99,8 @@ export interface GenOptions {
   n: number;
   refs: Blob[]; // 单人锁脸参考图；空数组 = 不锁脸
   characters?: CharSlot[]; // 非空 = 多人模式
+  preset?: Preset; // 当前选中的预设（注入提示词 + NovelAI 的 vibe）
+  onVibeEncoded?: (vibeId: string, key: string, b64: string) => void;
   signal?: AbortSignal;
 }
 
@@ -145,6 +146,25 @@ function b64ToBlob(b64: string, type = 'image/png'): Blob {
 
 function blobToResult(blob: Blob): GenResult {
   return { blob, url: URL.createObjectURL(blob) };
+}
+
+async function blobToB64(blob: Blob): Promise<string> {
+  const dataUrl: string = await new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(fr.result as string);
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(blob);
+  });
+  return dataUrl.split(',')[1];
+}
+
+function bytesToB64(bytes: Uint8Array): string {
+  let s = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    s += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunk)));
+  }
+  return btoa(s);
 }
 
 // ---------------- OpenAI 兼容（gpt-image-1 等） ----------------
@@ -277,13 +297,32 @@ async function toNaiReference(blob: Blob): Promise<string> {
   const png: Blob = await new Promise((resolve, reject) =>
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('参考图转换失败'))), 'image/png'),
   );
-  const dataUrl: string = await new Promise((resolve, reject) => {
-    const fr = new FileReader();
-    fr.onload = () => resolve(fr.result as string);
-    fr.onerror = () => reject(fr.error);
-    fr.readAsDataURL(png);
-  });
-  return dataUrl.split(',')[1];
+  return blobToB64(png);
+}
+
+// V4 以上的 vibe 要先让服务器“编码”一次（POST /ai/encode-vibe），拿到的字节再当作 reference_image_multiple 传回去。
+// 请求格式参考 NekoAI-API 的 examples/requests/vibe-encode.py。
+async function encodeVibe(
+  base: string,
+  token: string,
+  model: string,
+  blob: Blob,
+  info: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(`${base}/ai/encode-vibe`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: await blobToB64(blob), information_extracted: info, model }),
+      signal,
+    });
+  } catch (e) {
+    throw wrapNetworkError(e, '如果是跨域被拦，需要把接口地址换成你自己的代理（Worker）。');
+  }
+  if (!res.ok) throw new Error(`vibe 编码失败：${await readError(res)}`);
+  return bytesToB64(new Uint8Array(await res.arrayBuffer()));
 }
 
 async function generateNovelAI(o: GenOptions): Promise<GenResult[]> {
@@ -299,14 +338,33 @@ async function generateNovelAI(o: GenOptions): Promise<GenResult[]> {
     // NovelAI 官方说明：多张角色参考会把几个人的脸混在一起，而不是分开对应
     if (distinct.length > 1) {
       throw new Error(
-        'NovelAI 官方说明：同时用多张角色参考会把几个人的脸混在一起，不会分开对应。请只给其中一个角色选参考图，或者改用 OpenAI 兼容接口。',
+        'NovelAI 官方说明：同时用多张角色参考会把几个人的脸混在一起，不会分开对应。请只给其中一个角色选参考图，或者改用 GPT 那一套。',
       );
     }
     refBlobs = distinct;
   }
 
+  const vibes = (o.preset?.vibes ?? []).filter((v) => v.enabled);
+  // NovelAI 官方说明：Vibe Transfer 和 Precise Reference（角色参考）目前不能同时使用
+  if (vibes.length > 0 && refBlobs.length > 0) {
+    throw new Error(
+      'NovelAI 官方说明：氛围迁移（vibe）和角色参考目前不能同时使用。请关掉一个：去掉「启用锁脸」，或在预设里取消勾选 vibe。',
+    );
+  }
+
   const refB64: string[] = [];
   for (const b of refBlobs) refB64.push(await toNaiReference(b));
+
+  const vibeB64: string[] = [];
+  for (const v of vibes) {
+    const key = `${c.model}:${v.info}`;
+    let enc = v.cache?.[key];
+    if (!enc) {
+      enc = await encodeVibe(base, c.token, c.model, v.blob, v.info, o.signal);
+      o.onVibeEncoded?.(v.id, key, enc);
+    }
+    vibeB64.push(enc);
+  }
 
   // 角色提示词：结构参考 NekoAI 对 NovelAI 接口的封装（characterPrompts + v4_prompt.char_captions）
   const charPrompts = chars.map((ch) => ({
@@ -375,6 +433,11 @@ async function generateNovelAI(o: GenOptions): Promise<GenResult[]> {
       parameters.director_reference_strength_values = refB64.map(() => c.refStrength);
       parameters.director_reference_secondary_strength_values = refB64.map(() => 1 - c.refFidelity);
     }
+    if (vibeB64.length > 0) {
+      // V4 以上：传的是编码后的 vibe，information_extracted 已经在编码时用过，不再重复传（参考 NekoAI 的做法）
+      parameters.reference_image_multiple = vibeB64;
+      parameters.reference_strength_multiple = vibes.map((v) => v.strength);
+    }
 
     let res: Response;
     try {
@@ -403,9 +466,30 @@ async function generateNovelAI(o: GenOptions): Promise<GenResult[]> {
 }
 
 export async function generateImages(o: GenOptions): Promise<GenResult[]> {
-  const full: GenOptions = {
+  const p = o.preset;
+  const pre = (p?.prefix ?? '').trim();
+  const suf = (p?.suffix ?? '').trim();
+  const pneg = (p?.negative ?? '').trim();
+  const mine = o.prompt.trim();
+  const myNeg = o.negative.trim();
+
+  if (o.cfg.provider === 'novelai') {
+    return generateNovelAI({
+      ...o,
+      prompt: [pre, mine, suf].filter(Boolean).join(', '),
+      negative: [myNeg, pneg].filter(Boolean).join(', '),
+    });
+  }
+  // GPT：注入提示词可以很长，用空行隔开，不做任何长度截断
+  return generateOpenAI({
     ...o,
-    prompt: [o.cfg.prefix.trim(), o.prompt.trim(), o.cfg.suffix.trim()].filter(Boolean).join(', '),
-  };
-  return o.cfg.provider === 'novelai' ? generateNovelAI(full) : generateOpenAI(full);
+    prompt: [pre, mine, suf].filter(Boolean).join('\n\n'),
+    negative: [myNeg, pneg].filter(Boolean).join('; '),
+  });
+}
+
+// 粗略估算 NovelAI 的 T5 token 数（仅作参考，不是精确值）。官方上限：基础提示词 + 所有角色提示词合计约 512。
+export function estimateTokens(text: string): number {
+  const m = text.match(/[A-Za-z]+|[0-9]+|[^\sA-Za-z0-9]/g);
+  return m ? Math.ceil(m.length * 1.3) : 0;
 }

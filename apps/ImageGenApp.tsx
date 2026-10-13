@@ -6,16 +6,22 @@ import {
   ImageGenProvider,
   GenResult,
   SizeKey,
+  estimateTokens,
   generateImages,
   loadConfig,
   saveConfig,
 } from '../utils/imageGen';
 import {
+  Preset,
   StoredHistory,
   StoredRef,
+  VibeItem,
   loadHistory,
+  loadPresets,
   loadRefs,
+  newPreset,
   saveHistory,
+  savePresets,
   saveRefs,
   uid,
 } from '../utils/imageGenStore';
@@ -27,6 +33,7 @@ const SIZES: { k: SizeKey; label: string }[] = [
 ];
 
 const MAX_CHARS = 4;
+const NAI_TOKEN_LIMIT = 512; // 官方：基础提示词 + 所有角色提示词合计约 512 T5 tokens
 
 interface CharState {
   id: string;
@@ -43,7 +50,7 @@ const newChar = (i: number): CharState => ({
   prompt: '',
   uc: '',
   auto: false,
-  col: i === 0 ? 1 : 3, // 第一个默认偏左，第二个默认偏右
+  col: i === 0 ? 1 : 3,
   row: 2,
   refId: '',
 });
@@ -58,7 +65,6 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
   </label>
 );
 
-// 5x5 位置格（NovelAI V4/V4.5 的角色位置就是这个 5x5）
 const PosGrid: React.FC<{ col: number; row: number; onPick: (col: number, row: number) => void; disabled?: boolean }> = ({
   col,
   row,
@@ -82,70 +88,138 @@ const PosGrid: React.FC<{ col: number; row: number; onPick: (col: number, row: n
   </div>
 );
 
-const ImageGenApp: React.FC = () => {
-  const { closeApp } = useOS();
-  const [cfg, setCfg] = useState<ImageGenConfig>(() => loadConfig());
+// ============ 一套独立的工作区：GPT 和 NovelAI 各自一个实例，状态/参考图/历史/预设全部分开 ============
+
+const Workspace: React.FC<{
+  provider: ImageGenProvider;
+  cfg: ImageGenConfig;
+  onCfg: (next: ImageGenConfig) => void;
+}> = ({ provider, cfg, onCfg }) => {
+  const isNai = provider === 'novelai';
+  const sec = isNai ? cfg.novelai : cfg.openai;
+
+  const [loaded, setLoaded] = useState(false);
   const [refs, setRefs] = useState<StoredRef[]>([]);
   const [history, setHistory] = useState<StoredHistory[]>([]);
+  const [presets, setPresets] = useState<Preset[]>([]);
   const [lockOn, setLockOn] = useState(true);
   const [multi, setMulti] = useState(false);
   const [chars, setChars] = useState<CharState[]>([newChar(0), newChar(1)]);
   const [prompt, setPrompt] = useState('');
-  const [negative, setNegative] = useState(() => loadConfig().negativeDefault);
+  const [negative, setNegative] = useState('');
   const [size, setSize] = useState<SizeKey>('portrait');
   const [n, setN] = useState(1);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [results, setResults] = useState<GenResult[]>([]);
-  const [tab, setTab] = useState<'make' | 'history'>('make');
+  const [tab, setTab] = useState<'make' | 'presets' | 'history'>('make');
   const [showSettings, setShowSettings] = useState(false);
   const [preview, setPreview] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const vibeFileRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    loadRefs().then(setRefs);
-    loadHistory().then(setHistory);
-  }, []);
+    (async () => {
+      const [r, h, p] = await Promise.all([loadRefs(provider), loadHistory(provider), loadPresets(provider)]);
+      setRefs(r);
+      setHistory(h);
+      setPresets(p.length ? p : [newPreset(provider)]);
+      setLoaded(true);
+    })();
+  }, [provider]);
+
+  // 预设改动后防抖保存
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => savePresets(provider, presets), 400);
+    return () => clearTimeout(t);
+  }, [presets, loaded, provider]);
+
+  const activePreset = presets.find((p) => p.id === sec.activePresetId) ?? presets[0];
 
   const refUrls = useMemo(() => refs.map((r) => URL.createObjectURL(r.blob)), [refs]);
   useEffect(() => () => refUrls.forEach((u) => URL.revokeObjectURL(u)), [refUrls]);
   const histUrls = useMemo(() => history.map((h) => URL.createObjectURL(h.blob)), [history]);
   useEffect(() => () => histUrls.forEach((u) => URL.revokeObjectURL(u)), [histUrls]);
+  const vibes = activePreset?.vibes ?? [];
+  const vibeUrls = useMemo(() => vibes.map((v) => URL.createObjectURL(v.blob)), [vibes.map((v) => v.id).join(',')]);
+  useEffect(() => () => vibeUrls.forEach((u) => URL.revokeObjectURL(u)), [vibeUrls]);
 
-  const patch = (p: Partial<ImageGenConfig>) => {
-    const next = { ...cfg, ...p };
-    setCfg(next);
-    saveConfig(next);
+  const setSection = (p: Partial<typeof sec>) =>
+    onCfg(isNai ? { ...cfg, novelai: { ...cfg.novelai, ...p } } : { ...cfg, openai: { ...cfg.openai, ...p } });
+  const setOpenAI = (p: Partial<ImageGenConfig['openai']>) => onCfg({ ...cfg, openai: { ...cfg.openai, ...p } });
+  const setNai = (p: Partial<ImageGenConfig['novelai']>) => onCfg({ ...cfg, novelai: { ...cfg.novelai, ...p } });
+
+  const patchPreset = (p: Partial<Preset>) => {
+    if (!activePreset) return;
+    setPresets((list) => list.map((x) => (x.id === activePreset.id ? { ...x, ...p } : x)));
   };
-  const patchOpenAI = (p: Partial<ImageGenConfig['openai']>) => patch({ openai: { ...cfg.openai, ...p } });
-  const patchNai = (p: Partial<ImageGenConfig['novelai']>) => patch({ novelai: { ...cfg.novelai, ...p } });
+  const patchVibe = (id: string, p: Partial<VibeItem>) =>
+    patchPreset({
+      vibes: vibes.map((v) => (v.id === id ? { ...v, ...p, ...(p.info !== undefined ? { cache: {} } : {}) } : v)),
+    });
+
+  const addPreset = () => {
+    const p = newPreset(provider, `预设 ${presets.length + 1}`);
+    setPresets([...presets, p]);
+    setSection({ activePresetId: p.id });
+  };
+  const dupPreset = () => {
+    if (!activePreset) return;
+    const copy: Preset = {
+      ...activePreset,
+      id: uid(),
+      name: `${activePreset.name} 副本`,
+      vibes: activePreset.vibes.map((v) => ({ ...v, id: uid() })),
+    };
+    setPresets([...presets, copy]);
+    setSection({ activePresetId: copy.id });
+  };
+  const delPreset = () => {
+    if (!activePreset || presets.length <= 1) return;
+    const rest = presets.filter((p) => p.id !== activePreset.id);
+    setPresets(rest);
+    setSection({ activePresetId: rest[0].id });
+  };
+
+  const addVibes = (files: FileList | null) => {
+    if (!files || !files.length || !activePreset) return;
+    const added: VibeItem[] = Array.from(files).map((f) => ({
+      id: uid(),
+      name: f.name.replace(/\.[^.]+$/, ''),
+      blob: f,
+      strength: 0.6,
+      info: 1,
+      enabled: true,
+    }));
+    patchPreset({ vibes: [...vibes, ...added] });
+    if (vibeFileRef.current) vibeFileRef.current.value = '';
+  };
 
   const patchChar = (id: string, p: Partial<CharState>) =>
     setChars((list) => list.map((c) => (c.id === id ? { ...c, ...p } : c)));
 
-  const addRefs = async (files: FileList | null) => {
+  const addRefs = (files: FileList | null) => {
     if (!files || !files.length) return;
     const added: StoredRef[] = Array.from(files).map((f) => ({ id: uid(), name: f.name, blob: f }));
     const next = [...refs, ...added].slice(0, 4);
     setRefs(next);
-    saveRefs(next);
+    saveRefs(provider, next);
     setLockOn(true);
     if (fileRef.current) fileRef.current.value = '';
   };
-
   const removeRef = (id: string) => {
     const next = refs.filter((r) => r.id !== id);
     setRefs(next);
-    saveRefs(next);
+    saveRefs(provider, next);
     setChars((list) => list.map((c) => (c.refId === id ? { ...c, refId: '' } : c)));
   };
-
   const useAsRef = (blob?: Blob) => {
     if (!blob) return;
     const next = [...refs, { id: uid(), name: 'generated.png', blob }].slice(0, 4);
     setRefs(next);
-    saveRefs(next);
+    saveRefs(provider, next);
     setLockOn(true);
     setTab('make');
   };
@@ -178,13 +252,21 @@ const ImageGenApp: React.FC = () => {
     abortRef.current = ctrl;
     try {
       const imgs = await generateImages({
-        cfg,
+        cfg: { ...cfg, provider },
         prompt,
         negative,
         size,
         n,
         refs: !multi && lockOn ? refs.map((r) => r.blob) : [],
         characters,
+        preset: activePreset,
+        onVibeEncoded: (vibeId, key, b64) =>
+          setPresets((list) =>
+            list.map((p) => ({
+              ...p,
+              vibes: p.vibes.map((v) => (v.id === vibeId ? { ...v, cache: { ...(v.cache || {}), [key]: b64 } } : v)),
+            })),
+          ),
         signal: ctrl.signal,
       });
       setResults(imgs);
@@ -194,12 +276,11 @@ const ImageGenApp: React.FC = () => {
           id: uid(),
           createdAt: Date.now(),
           prompt: multi ? `${prompt} | ${characters?.map((c) => c.prompt).join(' | ')}` : prompt,
-          provider: cfg.provider,
           blob: i.blob as Blob,
         }));
       const merged = [...fresh, ...history].slice(0, 40);
       setHistory(merged);
-      saveHistory(merged);
+      saveHistory(provider, merged);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -211,27 +292,44 @@ const ImageGenApp: React.FC = () => {
   const removeHistory = (id: string) => {
     const next = history.filter((h) => h.id !== id);
     setHistory(next);
-    saveHistory(next);
+    saveHistory(provider, next);
   };
 
+  // 长度提示：NovelAI 显示 token 估算（官方上限约 512），GPT 只显示字数（这边不做任何截断）
+  const allText = [
+    activePreset?.prefix ?? '',
+    prompt,
+    activePreset?.suffix ?? '',
+    ...(multi ? chars.map((c) => c.prompt) : []),
+  ].join(' ');
+  const tokenEst = estimateTokens(allText);
+  const lengthHint = isNai ? (
+    <div className={`text-[11px] ${tokenEst > NAI_TOKEN_LIMIT ? 'text-red-500 font-bold' : tokenEst > NAI_TOKEN_LIMIT * 0.9 ? 'text-amber-600' : 'text-slate-400'}`}>
+      估算约 {tokenEst} / {NAI_TOKEN_LIMIT} token（预设前后缀 + 提示词 + 角色合计；NovelAI 模型自己的上限，改不了）
+    </div>
+  ) : (
+    <div className="text-[11px] text-slate-400">共 {allText.trim().length} 字（这边不限长度，上限由你用的接口决定）</div>
+  );
+
+  if (!loaded) return <div className="flex-1 flex items-center justify-center text-sm text-slate-400">加载中…</div>;
+
   return (
-    <div
-      className="w-full h-full flex flex-col bg-slate-50 text-slate-800"
-      style={{ paddingTop: 'var(--chrome-top, 1.5rem)' }}
-    >
-      {/* 顶栏 */}
-      <div className="flex items-center justify-between px-4 py-3 bg-white/80 backdrop-blur border-b border-slate-200">
-        <button onClick={closeApp} className="text-sm font-bold text-slate-500 active:scale-95">
-          返回
-        </button>
+    <>
+      <div className="flex items-center justify-between px-4 py-2 bg-white/60 border-b border-slate-200">
         <div className="flex gap-1 bg-slate-100 rounded-full p-0.5 text-xs font-bold">
-          {(['make', 'history'] as const).map((t) => (
+          {(
+            [
+              ['make', '生图'],
+              ['presets', isNai ? '串/vibe' : '注入提示词'],
+              ['history', `历史 ${history.length}`],
+            ] as const
+          ).map(([k, label]) => (
             <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`px-3 py-1 rounded-full ${tab === t ? 'bg-white shadow text-violet-600' : 'text-slate-500'}`}
+              key={k}
+              onClick={() => setTab(k)}
+              className={`px-3 py-1 rounded-full ${tab === k ? 'bg-white shadow text-violet-600' : 'text-slate-500'}`}
             >
-              {t === 'make' ? '生图' : `历史 ${history.length}`}
+              {label}
             </button>
           ))}
         </div>
@@ -241,36 +339,23 @@ const ImageGenApp: React.FC = () => {
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-        {/* 设置 */}
+        {/* 设置：只显示当前这一套的接口参数 */}
         {showSettings && (
           <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3">
-            <div className="flex gap-2">
-              {(['openai', 'novelai'] as ImageGenProvider[]).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => patch({ provider: p })}
-                  className={`flex-1 py-2 rounded-xl text-sm font-bold border ${
-                    cfg.provider === p ? 'bg-violet-500 text-white border-violet-500' : 'bg-white text-slate-500 border-slate-200'
-                  }`}
-                >
-                  {p === 'openai' ? 'OpenAI 兼容' : 'NovelAI'}
-                </button>
-              ))}
-            </div>
-
-            {cfg.provider === 'openai' ? (
+            <div className="text-xs font-bold text-violet-600">{isNai ? 'NovelAI' : 'GPT（OpenAI 兼容）'} 设置（与另一套互不关联）</div>
+            {!isNai ? (
               <>
                 <Field label="接口地址（Base URL）">
-                  <input className={inputCls} value={cfg.openai.baseUrl} onChange={(e) => patchOpenAI({ baseUrl: e.target.value })} />
+                  <input className={inputCls} value={cfg.openai.baseUrl} onChange={(e) => setOpenAI({ baseUrl: e.target.value })} />
                 </Field>
                 <Field label="API Key">
-                  <input className={inputCls} type="password" value={cfg.openai.apiKey} onChange={(e) => patchOpenAI({ apiKey: e.target.value })} />
+                  <input className={inputCls} type="password" value={cfg.openai.apiKey} onChange={(e) => setOpenAI({ apiKey: e.target.value })} />
                 </Field>
                 <Field label="模型">
-                  <input className={inputCls} value={cfg.openai.model} onChange={(e) => patchOpenAI({ model: e.target.value })} />
+                  <input className={inputCls} value={cfg.openai.model} onChange={(e) => setOpenAI({ model: e.target.value })} />
                 </Field>
                 <Field label="质量">
-                  <select className={inputCls} value={cfg.openai.quality} onChange={(e) => patchOpenAI({ quality: e.target.value as ImageGenConfig['openai']['quality'] })}>
+                  <select className={inputCls} value={cfg.openai.quality} onChange={(e) => setOpenAI({ quality: e.target.value as ImageGenConfig['openai']['quality'] })}>
                     <option value="auto">auto</option>
                     <option value="low">low</option>
                     <option value="medium">medium</option>
@@ -278,53 +363,119 @@ const ImageGenApp: React.FC = () => {
                   </select>
                 </Field>
                 <label className="flex items-center gap-2 text-sm">
-                  <input type="checkbox" checked={cfg.openai.highFidelity} onChange={(e) => patchOpenAI({ highFidelity: e.target.checked })} />
-                  锁脸时用高保真（input_fidelity=high，更像参考图；中转不支持就关掉）
+                  <input type="checkbox" checked={cfg.openai.highFidelity} onChange={(e) => setOpenAI({ highFidelity: e.target.checked })} />
+                  锁脸时用高保真（input_fidelity=high；中转不支持就关掉）
                 </label>
               </>
             ) : (
               <>
                 <Field label="接口地址">
-                  <input className={inputCls} value={cfg.novelai.baseUrl} onChange={(e) => patchNai({ baseUrl: e.target.value })} />
+                  <input className={inputCls} value={cfg.novelai.baseUrl} onChange={(e) => setNai({ baseUrl: e.target.value })} />
                 </Field>
                 <Field label="Token（Persistent API Token）">
-                  <input className={inputCls} type="password" value={cfg.novelai.token} onChange={(e) => patchNai({ token: e.target.value })} />
+                  <input className={inputCls} type="password" value={cfg.novelai.token} onChange={(e) => setNai({ token: e.target.value })} />
                 </Field>
                 <Field label="模型">
-                  <input className={inputCls} value={cfg.novelai.model} onChange={(e) => patchNai({ model: e.target.value })} />
+                  <input className={inputCls} value={cfg.novelai.model} onChange={(e) => setNai({ model: e.target.value })} />
                 </Field>
                 <div className="grid grid-cols-2 gap-2">
                   <Field label={`步数 ${cfg.novelai.steps}`}>
-                    <input type="range" min={10} max={50} value={cfg.novelai.steps} onChange={(e) => patchNai({ steps: Number(e.target.value) })} className="w-full" />
+                    <input type="range" min={10} max={50} value={cfg.novelai.steps} onChange={(e) => setNai({ steps: Number(e.target.value) })} className="w-full" />
                   </Field>
                   <Field label={`提示词相关度 ${cfg.novelai.scale}`}>
-                    <input type="range" min={1} max={10} step={0.5} value={cfg.novelai.scale} onChange={(e) => patchNai({ scale: Number(e.target.value) })} className="w-full" />
+                    <input type="range" min={1} max={10} step={0.5} value={cfg.novelai.scale} onChange={(e) => setNai({ scale: Number(e.target.value) })} className="w-full" />
                   </Field>
-                  <Field label={`参考强度 ${cfg.novelai.refStrength}`}>
-                    <input type="range" min={0} max={1} step={0.05} value={cfg.novelai.refStrength} onChange={(e) => patchNai({ refStrength: Number(e.target.value) })} className="w-full" />
+                  <Field label={`角色参考 Strength ${cfg.novelai.refStrength}`}>
+                    <input type="range" min={0} max={1} step={0.05} value={cfg.novelai.refStrength} onChange={(e) => setNai({ refStrength: Number(e.target.value) })} className="w-full" />
                   </Field>
-                  <Field label={`参考保真度 ${cfg.novelai.refFidelity}`}>
-                    <input type="range" min={0} max={1} step={0.05} value={cfg.novelai.refFidelity} onChange={(e) => patchNai({ refFidelity: Number(e.target.value) })} className="w-full" />
+                  <Field label={`角色参考 Fidelity ${cfg.novelai.refFidelity}`}>
+                    <input type="range" min={0} max={1} step={0.05} value={cfg.novelai.refFidelity} onChange={(e) => setNai({ refFidelity: Number(e.target.value) })} className="w-full" />
                   </Field>
                 </div>
               </>
             )}
-
-            <Field label="固定前缀（每次自动加在提示词前，比如画风/质量词）">
-              <input className={inputCls} value={cfg.prefix} onChange={(e) => patch({ prefix: e.target.value })} />
-            </Field>
-            <Field label="固定后缀">
-              <input className={inputCls} value={cfg.suffix} onChange={(e) => patch({ suffix: e.target.value })} />
-            </Field>
-            <Field label="默认负面提示词">
-              <input className={inputCls} value={cfg.negativeDefault} onChange={(e) => patch({ negativeDefault: e.target.value })} />
-            </Field>
           </div>
         )}
 
-        {tab === 'make' ? (
+        {/* 预设选择（生图页和预设页都能切） */}
+        {tab !== 'history' && (
+          <div className="rounded-2xl bg-white border border-slate-200 p-3 flex items-center gap-2">
+            <div className="text-[11px] font-bold text-slate-500 shrink-0">{isNai ? '当前串预设' : '当前注入'}</div>
+            <select className={inputCls} value={activePreset?.id ?? ''} onChange={(e) => setSection({ activePresetId: e.target.value })}>
+              {presets.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {tab === 'presets' && activePreset && (
+          <div className="rounded-2xl bg-white border border-slate-200 p-4 space-y-3">
+            <div className="flex gap-2">
+              <input className={inputCls} value={activePreset.name} onChange={(e) => patchPreset({ name: e.target.value })} placeholder="预设名称" />
+              <button onClick={addPreset} className="px-3 rounded-xl bg-violet-500 text-white text-xs font-bold shrink-0">
+                新建
+              </button>
+              <button onClick={dupPreset} className="px-3 rounded-xl bg-slate-100 text-slate-600 text-xs font-bold shrink-0">
+                复制
+              </button>
+              <button onClick={delPreset} disabled={presets.length <= 1} className="px-3 rounded-xl bg-slate-100 text-red-500 text-xs font-bold shrink-0 disabled:opacity-30">
+                删除
+              </button>
+            </div>
+            <Field label={isNai ? '画师串 / 前缀（每次自动加在提示词前）' : '注入提示词（前缀，可以很长）'}>
+              <textarea className={`${inputCls} resize-y`} rows={isNai ? 4 : 10} value={activePreset.prefix} onChange={(e) => patchPreset({ prefix: e.target.value })} />
+            </Field>
+            <Field label="后缀（每次自动加在提示词后）">
+              <textarea className={`${inputCls} resize-y`} rows={isNai ? 2 : 5} value={activePreset.suffix} onChange={(e) => patchPreset({ suffix: e.target.value })} />
+            </Field>
+            <Field label="负面提示词">
+              <textarea className={`${inputCls} resize-y`} rows={3} value={activePreset.negative} onChange={(e) => patchPreset({ negative: e.target.value })} />
+            </Field>
+            {lengthHint}
+
+            {isNai && (
+              <div className="space-y-2">
+                <div className="text-xs font-bold text-slate-600">氛围迁移（vibe）——跟随这套预设保存</div>
+                <div className="text-[11px] text-slate-400 leading-relaxed">
+                  官方说明：V4 以上每张图第一次编码成 vibe 收 2 Anlas，改 Info 需要重新编码；这里会把编码结果缓存在本机，不重复收费。vibe 与角色参考目前不能同时用。
+                </div>
+                {vibes.map((v, i) => (
+                  <div key={v.id} className="rounded-xl border border-slate-200 bg-slate-50 p-2 flex gap-2">
+                    <img src={vibeUrls[i]} className={`w-16 h-16 object-cover rounded-lg shrink-0 ${v.enabled ? '' : 'opacity-40'}`} />
+                    <div className="flex-1 space-y-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <input type="checkbox" checked={v.enabled} onChange={(e) => patchVibe(v.id, { enabled: e.target.checked })} />
+                        <input className="flex-1 min-w-0 bg-transparent text-xs font-bold outline-none" value={v.name} onChange={(e) => patchVibe(v.id, { name: e.target.value })} />
+                        <button onClick={() => patchPreset({ vibes: vibes.filter((x) => x.id !== v.id) })} className="text-[11px] text-slate-400">
+                          删除
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                        <span className="w-16 shrink-0">Strength {v.strength}</span>
+                        <input type="range" min={0} max={1} step={0.05} value={v.strength} onChange={(e) => patchVibe(v.id, { strength: Number(e.target.value) })} className="flex-1" />
+                      </div>
+                      <div className="flex items-center gap-2 text-[11px] text-slate-500">
+                        <span className="w-16 shrink-0">Info {v.info}</span>
+                        <input type="range" min={0} max={1} step={0.05} value={v.info} onChange={(e) => patchVibe(v.id, { info: Number(e.target.value) })} className="flex-1" />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                <button onClick={() => vibeFileRef.current?.click()} className="w-full py-2 rounded-xl border-2 border-dashed border-slate-300 text-slate-400 text-sm active:scale-95">
+                  + 添加 vibe 图
+                </button>
+                <input ref={vibeFileRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => addVibes(e.target.files)} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === 'make' && (
           <>
-            {/* 参考图 */}
+            {/* 参考图（锁脸） */}
             <div className="rounded-2xl bg-white border border-slate-200 p-4">
               <div className="flex items-center justify-between mb-2">
                 <div className="text-sm font-bold">锁脸参考图（最多 4 张）</div>
@@ -352,6 +503,7 @@ const ImageGenApp: React.FC = () => {
               <input ref={fileRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => addRefs(e.target.files)} />
               <div className="text-[11px] text-slate-400 mt-2">
                 {multi ? '多人模式：在下面每个角色里选用哪张参考图。' : '传一张清晰的正脸/半身图，生成时会尽量保持同一张脸。'}
+                {isNai && ' （NovelAI 角色参考只支持 V4.5 模型，且不能和 vibe 同时用）'}
               </div>
             </div>
 
@@ -371,13 +523,14 @@ const ImageGenApp: React.FC = () => {
 
               <Field label={multi ? '整体提示词（场景、画风、人数标签）' : '提示词'}>
                 <textarea
-                  className={inputCls}
-                  rows={multi ? 3 : 4}
+                  className={`${inputCls} resize-y`}
+                  rows={multi ? 4 : 8}
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
                   placeholder={multi ? '例如：2girls, indoors, side-by-side（人数标签写这里）' : '想画什么就写什么……'}
                 />
               </Field>
+              {lengthHint}
 
               {multi && (
                 <div className="space-y-3">
@@ -395,8 +548,8 @@ const ImageGenApp: React.FC = () => {
                         )}
                       </div>
                       <textarea
-                        className={inputCls}
-                        rows={2}
+                        className={`${inputCls} resize-y`}
+                        rows={3}
                         value={c.prompt}
                         onChange={(e) => patchChar(c.id, { prompt: e.target.value })}
                         placeholder="例如：girl, red hair, red dress, smile"
@@ -435,15 +588,15 @@ const ImageGenApp: React.FC = () => {
                       + 加一个角色
                     </button>
                   )}
-                  {cfg.provider === 'novelai' && (
+                  {isNai && (
                     <div className="text-[11px] text-amber-600 leading-relaxed">
-                      NovelAI 官方说明：同时用多张参考图会把几个人的脸混在一起。所以这里只能给一个角色选参考图；想两个人都锁脸，请用 OpenAI 兼容接口。
+                      NovelAI 官方说明：同时用多张角色参考会把几个人的脸混在一起，所以这里只能给一个角色选参考图；想两个人都锁脸，请用 GPT 那一套。
                     </div>
                   )}
                 </div>
               )}
 
-              <Field label="负面提示词（整体，不想出现的）">
+              <Field label="本次额外负面提示词（会和预设里的负面提示词合并）">
                 <textarea className={inputCls} rows={2} value={negative} onChange={(e) => setNegative(e.target.value)} />
               </Field>
               <div className="flex items-center gap-2">
@@ -476,7 +629,6 @@ const ImageGenApp: React.FC = () => {
               )}
             </div>
 
-            {/* 结果 */}
             {results.length > 0 && (
               <div className="grid grid-cols-2 gap-2">
                 {results.map((r, i) => (
@@ -493,7 +645,9 @@ const ImageGenApp: React.FC = () => {
               </div>
             )}
           </>
-        ) : (
+        )}
+
+        {tab === 'history' && (
           <div className="grid grid-cols-2 gap-2">
             {history.length === 0 && <div className="col-span-2 text-center text-sm text-slate-400 py-10">还没有历史</div>}
             {history.map((h, i) => (
@@ -519,6 +673,48 @@ const ImageGenApp: React.FC = () => {
           <img src={preview} className="max-w-full max-h-full rounded-xl" />
         </div>
       )}
+    </>
+  );
+};
+
+const ImageGenApp: React.FC = () => {
+  const { closeApp } = useOS();
+  const [cfg, setCfg] = useState<ImageGenConfig>(() => loadConfig());
+
+  const update = (next: ImageGenConfig) => {
+    setCfg(next);
+    saveConfig(next);
+  };
+
+  return (
+    <div
+      className="w-full h-full flex flex-col bg-slate-50 text-slate-800"
+      style={{ paddingTop: 'var(--chrome-top, 1.5rem)' }}
+    >
+      <div className="flex items-center justify-between px-4 py-3 bg-white/80 backdrop-blur border-b border-slate-200">
+        <button onClick={closeApp} className="text-sm font-bold text-slate-500 active:scale-95">
+          返回
+        </button>
+        <div className="flex gap-1 bg-slate-100 rounded-full p-0.5 text-xs font-bold">
+          {(
+            [
+              ['openai', 'GPT'],
+              ['novelai', 'NovelAI'],
+            ] as const
+          ).map(([k, label]) => (
+            <button
+              key={k}
+              onClick={() => update({ ...cfg, provider: k })}
+              className={`px-4 py-1 rounded-full ${cfg.provider === k ? 'bg-white shadow text-violet-600' : 'text-slate-500'}`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="w-8" />
+      </div>
+      {/* key = provider：切换时整套工作区重建，两边的提示词、参考图、历史、预设互不干扰 */}
+      <Workspace key={cfg.provider} provider={cfg.provider} cfg={cfg} onCfg={update} />
     </div>
   );
 };
