@@ -52,6 +52,7 @@ const ask = async (
   endpoint: '/gate' | '/allow' | '/wake',
   lastUserMessageAt: number | null,
   unanswered?: number,
+  lastSelfSendAt?: number | null,
 ): Promise<Answer> => {
   if (!cfg) return { ok: false };
   const ctrl = new AbortController();
@@ -60,7 +61,11 @@ const ask = async (
     const res = await fetch(`${cfg.url}${endpoint}`, {
       method: 'POST',
       headers: { 'X-Token': cfg.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ lastUserMessageAt, ...(typeof unanswered === 'number' ? { unanswered } : {}) }),
+      body: JSON.stringify({
+        lastUserMessageAt,
+        ...(typeof unanswered === 'number' ? { unanswered } : {}),
+        ...(typeof lastSelfSendAt === 'number' ? { lastSelfSendAt } : {}),
+      }),
       signal: ctrl.signal,
     });
     if (!res.ok) return { ok: false };
@@ -154,6 +159,8 @@ export const decideGate = async (opts: {
   isHeartbeat?: boolean;
   /** 角色已经主动找过他几次、他都没回（让提示词收着点）。 */
   unansweredSends?: number;
+  /** 角色最近一次主动发出去的时刻（没有就不传）。 */
+  lastSelfSendAt?: number | null;
 }): Promise<GateAction> => {
   if (!cfg) return { kind: 'pass', why: 'gate-off' };
   if (opts.instant) return { kind: 'pass', why: 'instant' };
@@ -161,7 +168,7 @@ export const decideGate = async (opts: {
 
   if (opts.isHeartbeat) {
     // 下一次已经排好了，所以这里放心 skip；服务连不上就不醒（宁可少醒，也别半夜盲调模型）。
-    const a = await ask('/wake', opts.lastUserMessageAt, opts.unansweredSends);
+    const a = await ask('/wake', opts.lastUserMessageAt, opts.unansweredSends, opts.lastSelfSendAt);
     if (!a.ok) return { kind: 'skip', why: 'wake-gate-down' };
     if (!a.yes) return { kind: 'skip', why: `wake-skip:${a.info.reason}` };
     rememberNote(opts.taskId ?? '', buildNote(a.info), opts.nowMs);
@@ -258,13 +265,31 @@ export const scheduleNextHeartbeat = async (a: {
 
 /** 心跳醒来时放进"本次任务"槽位的话：替掉"请发一条消息"那种口吻，让角色自己决定。 */
 export const heartbeatInstruction = (): string =>
-  [
-    '这是一次例行的醒来，不是谁在催你发消息。你自己决定要不要做点什么：',
-    '- 想主动跟他说点什么，就直接写出来，像平时那样说话；',
-    '- 想先做点事（看看他的动静、记下惦记的事、查点东西），就去做；',
-    '- 现在没什么想说的，或者不该打扰他，就只回复 [沉默]，这一轮什么都不会发出去。',
-    '别因为"到点了"硬凑一句；说了之后他还没回，就不要重复同样的话。不要提"心跳""例行醒来""系统"这些词。',
-  ].join('\n');
+  '这是一次例行的醒来，不是有事要交代，也没有谁在催你。要不要开口、要不要先做点事，由你自己决定，规则见下面的【例行醒来】。';
+
+const HB_SPEAK_BLOCK = [
+  '【例行醒来】',
+  '这是一次例行的醒来，不是有什么事非要你开口。先对照上面的【最近对话上下文】、你之前发过的话和他的近况。',
+  '默认是不说。只有真的有想对他说的话才开口，比如：',
+  '- 你惦记着他的某件事（他提过的约定、没聊完的话题、你担心的事），想问问或提一句；',
+  '- 他很久没出现，你确实想他了、想知道他在干嘛；',
+  '- 你有件小事想跟他分享，而且这会儿说不会打扰他。',
+  '拿不准就不说。你上一条主动发的他还没回，就别再发；刚聊完又没有新东西，也别硬找话说。',
+  '想先做点事（看看他的动静、记下惦记的事）就去做；做完没有想说的，同样不说。',
+  '决定不说 → 整段输出只写 [[SILENT]] 这一个标记，别的一个字都不要写，也不要解释。',
+].join('\n');
+
+/**
+ * 把渲染好的提示词里原版的【开口之前】（默认照常说）整段换成心跳版（默认不说）。
+ * 找不到那一段（老前端 / 模板改过）就把心跳版接在末尾，保证心跳那一轮一定读得到。
+ */
+export const rewriteSpeakBlock = (prompt: string): string => {
+  const start = prompt.indexOf('【开口之前】');
+  const endMark = '不要解释。';
+  const end = start < 0 ? -1 : prompt.indexOf(endMark, start);
+  if (start < 0 || end < 0) return `${prompt}\n\n${HB_SPEAK_BLOCK}`;
+  return prompt.slice(0, start) + HB_SPEAK_BLOCK + prompt.slice(end + endMark.length);
+};
 
 const HB_SCRATCH_KEY = '__heartbeat';
 

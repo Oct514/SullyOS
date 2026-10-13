@@ -204,6 +204,7 @@ import {
   heartbeatInstruction,
   isHeartbeatTask,
   isSilentHeartbeat,
+  rewriteSpeakBlock,
   isWatchTask,
   scheduleNextHeartbeat,
   takeGateNote,
@@ -2147,6 +2148,8 @@ export const amsgHooks = {
         taskId: String(ctx.task.id ?? ''),
         isHeartbeat: isHb,
         unansweredSends: countUnansweredSends(selfLog),
+        lastSelfSendAt:
+          selfLog?.entries.filter((e) => !e.reply).reduce<number | null>((m, e) => (m === null || e.at > m ? e.at : m), null) ?? null,
       });
       console.log('[amsg:gate]', { taskId: ctx.task.id, ...gate });
       if (gate.kind === 'defer') return { defer: { afterMs: gate.afterMs } } as const;
@@ -2419,7 +2422,7 @@ export const amsgHooks = {
       includeClock: toolPack.timeAwarenessEnabled,
     }), userHoliday) + mcpBlock + scheduleBlock + takeGateNote(String(ctx.task.id ?? ''));
     return {
-      messages: [{ role: 'user' as const, content: prompt }],
+      messages: [{ role: 'user' as const, content: isHb ? rewriteSpeakBlock(prompt) : prompt }],
       ...common,
     };
   },
