@@ -137,9 +137,11 @@ export function wake(now, commit, unanswered, lastSelfSendAt) {
   if (S.lastChat && (now - S.lastChat) / MIN < CFG.chatActiveMin) return no('fuse:in-chat');
   // TA 主动说了最后一句、你还没回：不再醒（时间不明也按不醒算）。
   const un = Number.isFinite(unanswered) ? unanswered : S.unanswered;
-  if (un >= 1 && (!Number.isFinite(lastSelfSendAt) || now - lastSelfSendAt < CFG.afterCharQuietH * HOUR)) return no('fuse:char-last');
-  if (S.sleeping && now - S.sleepAt < 12 * HOUR) return no('fuse:sleeping');
-  if (inWin(t.min, CFG.nightStart, CFG.nightEnd) && act(S.phoneActs, 20) + act(S.pcActs, 20) === 0) return no('fuse:night-quiet');
+  // 睡着 / 深夜没动静：不再拦着不醒——这是角色自己的时间（思考、调工具、联网），只提醒它别发消息吵醒你。
+  const asleep = (S.sleeping && now - S.sleepAt < 12 * HOUR)
+    || (inWin(t.min, CFG.nightStart, CFG.nightEnd) && act(S.phoneActs, 20) + act(S.pcActs, 20) === 0);
+  // 睡着时醒来不是为了发消息，所以不受上面"TA 主动说了最后一句"的限制。
+  if (!asleep && un >= 1 && (!Number.isFinite(lastSelfSendAt) || now - lastSelfSendAt < CFG.afterCharQuietH * HOUR)) return no('fuse:char-last');
   if (S.lastWake && (now - S.lastWake) / MIN < CFG.wakeMinGapMin) return no('fuse:wake-gap');
   const wakes = S.wakes?.day === t.day ? S.wakes.n : 0;
   if (wakes >= CFG.maxWakesPerDay) return no('fuse:wake-daily-cap');
@@ -149,7 +151,7 @@ export function wake(now, commit, unanswered, lastSelfSendAt) {
   if (commit) { S.lastWake = now; S.wakes = { day: t.day, n: wakes + 1 }; save(); }
   return {
     wake: true, reason: 'wake', unanswered: un,
-    context: { gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, openItems: items.map((i) => i.text) },
+    context: { gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, asleep, openItems: items.map((i) => i.text) },
   };
 }
 

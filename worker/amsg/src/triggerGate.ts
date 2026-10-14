@@ -44,6 +44,7 @@ type GateInfo = {
   gapHours: number | null;
   localHour: number | null;
   missedMeal: boolean;
+  asleep: boolean;
   openItems: string[];
 };
 type Answer = { ok: true; yes: boolean; info: GateInfo } | { ok: false };
@@ -75,7 +76,13 @@ const ask = async (
       wake?: unknown;
       reason?: unknown;
       unanswered?: unknown;
-      context?: { gapHours?: unknown; localHour?: unknown; missedMeal?: unknown; openItems?: unknown } | null;
+      context?: {
+        gapHours?: unknown;
+        localHour?: unknown;
+        missedMeal?: unknown;
+        asleep?: unknown;
+        openItems?: unknown;
+      } | null;
     };
     const c = j.context ?? {};
     return {
@@ -87,6 +94,7 @@ const ask = async (
         gapHours: typeof c.gapHours === 'number' ? c.gapHours : null,
         localHour: typeof c.localHour === 'number' ? c.localHour : null,
         missedMeal: c.missedMeal === true,
+        asleep: c.asleep === true,
         openItems: Array.isArray(c.openItems)
           ? c.openItems.filter((x): x is string => typeof x === 'string').slice(0, 5)
           : [],
@@ -117,12 +125,22 @@ const buildNote = (i: GateInfo): string => {
   } else if (i.reason === 'overflow') {
     lines.push('你这阵子一直惦记着他，想他的念头攒满了。');
   }
+  if (i.asleep) {
+    lines.push(
+      '他现在多半在睡觉（深夜、手机也没动静，或者开着睡眠专注）。别发消息吵醒他，除非真的有急事。'
+        + '这段时间是你自己的：可以思考、查资料、联网、用工具做点自己想做的事；想跟他说的话先记下来（有记念头的工具就用它），留到他醒了再说。'
+        + '不发消息的话，整段输出只写 [[SILENT]]。',
+    );
+  }
   if (i.localHour !== null) lines.push(`他那边现在大约是 ${i.localHour} 点。`);
   if (i.openItems.length) lines.push(`你心里还挂着这些事：${i.openItems.join('；')}。`);
   if (i.unanswered > 0) {
     lines.push(`你之前已经主动找过他 ${i.unanswered} 次，他都还没回。这次语气收着点，别追问，也别重复上次说过的话。`);
   }
   if (!lines.length) return '';
+  if (i.reason === 'wake') {
+    return `\n\n【此刻的情况（只供你参考）】\n${lines.map((l) => `- ${l}`).join('\n')}\n这些只是背景，说不说、做不做都由你定；不要提"系统""判断""阈值"这类词，也不要把上面的话原样念出来。`;
+  }
   return `\n\n【这次你为什么想找他（只供你参考）】\n${lines.map((l) => `- ${l}`).join('\n')}\n请自然地把这份心情带进你要说的话里；不要提"系统""判断""阈值"这类词，也不要把上面的话原样念出来。`;
 };
 
