@@ -6,12 +6,12 @@ export const TOOLS = [
   {
     name: 'remember_thought',
     description:
-      '记下一件你惦记着、还没了结、和他有关的事（他提过的约定、没聊完的话题、你担心的事）。' +
-      '记下后，之后你想主动找他的时候会带上它。只记真正会让你想找他的事，别把闲聊都记下来；最多同时记 8 条，几天后自动淡掉。',
+      '记下一件你惦记着、还没了结、和她有关的事（她提过的约定、没聊完的话题、你担心的事）。' +
+      '记下后，之后你想主动找她的时候会带上它。只记真正会让你想找她的事，别把闲聊都记下来；最多同时记 8 条，几天后自动淡掉。',
     inputSchema: {
       type: 'object',
       properties: {
-        text: { type: 'string', description: '一句话说清惦记什么，例如"他下午要面试，想问问结果"' },
+        text: { type: 'string', description: '一句话说清惦记什么，例如"她下午要面试，想问问结果"' },
         weight: { type: 'integer', minimum: 5, maximum: 25, description: '有多惦记：5 轻、15 中、25 重，默认 15' },
       },
       required: ['text'],
@@ -27,6 +27,22 @@ export const TOOLS = [
     description: '看看你现在记着哪些惦记的事。',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'write_diary',
+    description:
+      '醒来之后，把你这次做了什么、查到了什么、想到了什么，用一两句话记进日记。她打开「醒来记录」就能看到。' +
+      '静默醒来（没发消息）时尤其要记，不然她不知道你做过什么。别写长，一次一两句。',
+    inputSchema: {
+      type: 'object',
+      properties: { text: { type: 'string', description: '一两句话，例如"查了今天的天气，明天降温，想提醒她加衣服"' } },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'read_diary',
+    description: '看看你最近记的日记（最近 10 条），接着上次的事往下想。',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) });
@@ -38,7 +54,7 @@ function callTool(name, a, api) {
     if (!t) return text('要写清楚惦记什么（text 不能为空）。', true);
     const r = api.add(t, a.weight);
     if (r.full) return text(`念头已经记满 ${r.max} 条了，先用 resolve_thought 划掉已经了结的：\n${fmt(r.items)}`, true);
-    return text(`已记下（id ${r.item.id}）：${r.item.text}。之后想找他的时候会带上这件事；了结了记得用 resolve_thought 划掉。`);
+    return text(`已记下（id ${r.item.id}）：${r.item.text}。之后想找她的时候会带上这件事；了结了记得用 resolve_thought 划掉。`);
   }
   if (name === 'resolve_thought') {
     const id = Math.trunc(Number(a.id));
@@ -48,6 +64,16 @@ function callTool(name, a, api) {
       : text(`没有 id ${id} 这条（可能已经划掉或自己淡掉了）。可以先用 list_thoughts 看看。`, true);
   }
   if (name === 'list_thoughts') return text(fmt(api.list()));
+  if (name === 'write_diary') {
+    const t = typeof a.text === 'string' ? a.text.trim() : '';
+    if (!t) return text('日记不能是空的，写一两句就好。', true);
+    api.diaryAdd(t);
+    return text('已记进日记。她打开「醒来记录」就能看到。');
+  }
+  if (name === 'read_diary') {
+    const items = api.diaryList(10);
+    return text(items.length ? items.map((e) => `${e.when}　${e.text}`).join('\n') : '（日记还是空的）');
+  }
   return null;
 }
 

@@ -204,6 +204,8 @@ import {
   heartbeatInstruction,
   isHeartbeatTask,
   isSilentHeartbeat,
+  noteHeartbeatTools,
+  reportHeartbeat,
   rewriteSpeakBlock,
   isWatchTask,
   scheduleNextHeartbeat,
@@ -2154,7 +2156,7 @@ export const amsgHooks = {
       console.log('[amsg:gate]', { taskId: ctx.task.id, ...gate });
       if (gate.kind === 'defer') return { defer: { afterMs: gate.afterMs } } as const;
       if (gate.kind === 'skip') return { skip: true } as const;
-      if (isHb && gate.kind === 'pass') flagHeartbeat(ctx.scratch);
+      if (isHb && gate.kind === 'pass') flagHeartbeat(ctx.scratch, gate.wakeId);
     }
     
     // 客户端记录的（打包那一刻的快照）+ 角色自己在之前几次 fire 里排下、客户端还没认领的。
@@ -2559,6 +2561,24 @@ export const amsgHooks = {
         type: decision.decision,
         sessionId: ctx.sessionId,
         pushes: decision.decision === 'finish' ? decision.pushPayloads.length : 0,
+      });
+    }
+
+    // 心跳那一轮：收集工具名，结束时把结果回报给 Zeabur（给「醒来记录」看）。
+    if (decision.decision === 'tool-request') {
+      noteHeartbeatTools(ctx.scratch, decision.toolCalls.map((tc) => tc.function.name));
+    } else {
+      await reportHeartbeat(ctx.scratch, {
+        outcome:
+          decision.decision === 'finish'
+            ? 'sent'
+            : decision.reason === 'declined'
+              ? 'silent'
+              : decision.reason === 'side-effects-only'
+                ? 'actions-only'
+                : 'skipped',
+        reason: decision.decision === 'skip-push' ? String(decision.reason) : undefined,
+        text: decision.decision === 'finish' ? content.slice(0, 300) : undefined,
       });
     }
 

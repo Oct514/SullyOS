@@ -63,6 +63,17 @@ const MIN = 60000, HOUR = 3600000;
 // 还有效的念头：超过 itemTtlH 小时的自动淡掉；没有时间戳的老数据从现在起算。
 const liveItems = (now) => S.items.filter((i) => now - (i.at ??= now) < CFG.itemTtlH * HOUR);
 
+// 醒来记录 / 日记：一条一条存，保留 14 天、最多 400 条。给 GET /log 和之后的「醒来记录」App 用。
+const logAdd = (e) => {
+  S.log ??= []; S.logSeq ??= 1;
+  const entry = { id: S.logSeq++, at: Date.now(), ...e };
+  S.log.push(entry);
+  const cutoff = Date.now() - 14 * 24 * HOUR;
+  S.log = S.log.filter((x) => x.at > cutoff).slice(-400);
+  return entry;
+};
+const whenStr = (ts) => { const l = local(ts); return `${l.day} ${String(Math.floor(l.min / 60)).padStart(2, '0')}:${String(l.min % 60).padStart(2, '0')}`; };
+
 // 用户最后一次开口的时间（Worker 带来的）。比已知的新 = 他刚聊过：清零"没人理"和心绪。
 function syncChat(ts, now) {
   if (!Number.isFinite(ts) || ts <= 0 || ts > now + MIN) return;
@@ -188,6 +199,8 @@ const mcpApi = {
   },
   done(id) { const n = S.items.length; S.items = S.items.filter((i) => i.id !== id); save(); return S.items.length < n; },
   list() { return liveItems(Date.now()); },
+  diaryAdd(text) { const e = logAdd({ kind: 'diary', text: String(text).slice(0, 300) }); save(); return e; },
+  diaryList(n) { return (S.log ?? []).filter((x) => x.kind === 'diary').slice(-n).map((e) => ({ ...e, when: whenStr(e.at) })); },
 };
 
 const readBody = (req) => new Promise((ok) => {
@@ -220,10 +233,37 @@ const server = http.createServer(async (req, res) => {
     return send(200, Array.isArray(raw) ? out : out[0]);
   }
   if (parts[0] === 'event' && req.method === 'POST') return event(parts[1], u.searchParams, now) ? send(200, { ok: true }) : send(404, { error: 'unknown event' });
+  if (parts[0] === 'wake' && parts[1] === 'result' && req.method === 'POST') {
+    const b = await readBody(req);
+    const e = (S.log ?? []).find((x) => x.id === +b.wakeId);
+    if (e) {
+      e.outcome = String(b.outcome || '').slice(0, 20);
+      if (b.reason) e.skipReason = String(b.reason).slice(0, 60);
+      e.tools = Array.isArray(b.tools) ? b.tools.filter((x) => typeof x === 'string').slice(0, 20) : [];
+      if (b.text) e.text = String(b.text).slice(0, 300);
+      save();
+    }
+    return send(200, { ok: !!e });
+  }
+  if (parts[0] === 'log' && parts[1] === 'clear' && req.method === 'POST') { S.log = []; save(); return send(200, { ok: true }); }
+  if (parts[0] === 'log' && req.method === 'GET') {
+    const n = Math.min(Math.max(+u.searchParams.get('limit') || 100, 1), 400);
+    return send(200, { entries: (S.log ?? []).slice(-n).reverse(), now });
+  }
   if ((parts[0] === 'gate' || parts[0] === 'allow' || parts[0] === 'wake') && req.method === 'POST') {
     const b = await readBody(req);
     syncChat(+b.lastUserMessageAt, now);
-    return send(200, parts[0] === 'gate' ? decide(now, true) : parts[0] === 'wake' ? wake(now, true, +b.unanswered, b.lastSelfSendAt == null ? NaN : +b.lastSelfSendAt) : allow(now));
+    if (parts[0] === 'wake') {
+      const r = wake(now, true, +b.unanswered, b.lastSelfSendAt == null ? NaN : +b.lastSelfSendAt);
+      const c = r.context ?? {};
+      const e = logAdd({
+        kind: 'wake', decision: r.wake ? 'pass' : 'skip', reason: r.reason,
+        ...(r.wake ? { asleep: !!c.asleep, gapHours: c.gapHours, localHour: c.localHour } : {}),
+      });
+      save();
+      return send(200, { ...r, id: e.id });
+    }
+    return send(200, parts[0] === 'gate' ? decide(now, true) : allow(now));
   }
   if (parts[0] === 'status') return send(200, { ...decide(now, false), allow: allow(now), items: liveItems(now), sleeping: S.sleeping, lastChat: S.lastChat, lastAct: S.lastAct, lastFire: S.lastFire });
   if (parts[0] === 'item' && req.method === 'POST') {

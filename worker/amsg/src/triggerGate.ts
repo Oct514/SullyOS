@@ -1,21 +1,21 @@
 /**
  * 触发闸：到点发之前，先问 Zeabur 上的判断服务（trigger-service）现在该不该发。
  *
- * - 守望任务（补充灵感里带 [守望]）：问 /gate。服务说"现在该找他"才发，否则每分钟再问；
+ * - 守望任务（补充灵感里带 [守望]）：问 /gate。服务说"现在该找她"才发，否则每分钟再问；
  *   超过窗口还没触发就放弃这一次（重复任务会自动排到下一次，不影响明天）。
- * - 其余非即时任务（比如 TA 睡前给自己排的早安）：问 /allow。他还在睡觉（睡眠专注开着）就推迟，
+ * - 其余非即时任务（比如 TA 睡前给自己排的早安）：问 /allow。她还在睡觉（睡眠专注开着）就推迟，
  *   起床后再发。这里**只能 defer，不能 skip**——skip 会把一次性任务消费掉。
  * - 没配 TRIGGER_URL / TRIGGER_TOKEN：完全不介入，行为和以前一样。
  *
- * 守望任务放行时，服务会说明"为什么该找他"（失联多久、念头、之前几次没回），
- * 这里把它整理成一小段提示，等 onBeforeFire 拼提示词时用 takeGateNote(taskId) 取走，让 TA 知道为什么想找他。
+ * 守望任务放行时，服务会说明"为什么该找她"（失联多久、念头、之前几次没回），
+ * 这里把它整理成一小段提示，等 onBeforeFire 拼提示词时用 takeGateNote(taskId) 取走，让 TA 知道为什么想找她。
  *
  * 判断服务连不上时：守望任务推迟（到窗口结束自然放弃），普通任务最多多等 15 分钟就放行，
  * 绝不让早安因为服务挂了而丢。
  */
 
 export const WATCH_MARK = '[守望]';
-/** 守望窗口：名义触发时刻之后多久还没等到"该找他"，就放弃这一次。 */
+/** 守望窗口：名义触发时刻之后多久还没等到"该找她"，就放弃这一次。 */
 export const WATCH_WINDOW_MS = 90 * 60_000;
 /** 普通任务因为"在睡觉 / 刚聊完"最多被推迟多久，超过就放行（不让消息丢）。 */
 export const ALLOW_MAX_HOLD_MS = 3 * 3_600_000;
@@ -45,6 +45,7 @@ type GateInfo = {
   localHour: number | null;
   missedMeal: boolean;
   asleep: boolean;
+  wakeId: number | null;
   openItems: string[];
 };
 type Answer = { ok: true; yes: boolean; info: GateInfo } | { ok: false };
@@ -74,6 +75,7 @@ const ask = async (
       fire?: unknown;
       allow?: unknown;
       wake?: unknown;
+      id?: unknown;
       reason?: unknown;
       unanswered?: unknown;
       context?: {
@@ -95,6 +97,7 @@ const ask = async (
         localHour: typeof c.localHour === 'number' ? c.localHour : null,
         missedMeal: c.missedMeal === true,
         asleep: c.asleep === true,
+        wakeId: typeof j.id === 'number' ? j.id : null,
         openItems: Array.isArray(c.openItems)
           ? c.openItems.filter((x): x is string => typeof x === 'string').slice(0, 5)
           : [],
@@ -107,42 +110,45 @@ const ask = async (
   }
 };
 
-/** 把服务给的"为什么该找他"整理成一小段提示，接在提示词末尾。没有可说的就返回空串。 */
+/** 把服务给的"为什么该找她"整理成一小段提示，接在提示词末尾。没有可说的就返回空串。 */
 const buildNote = (i: GateInfo): string => {
   const lines: string[] = [];
   if (i.reason === 'long-silence') {
     lines.push(
       i.gapHours !== null
-        ? `他已经大约 ${i.gapHours} 小时没有消息、也没见到他的动静了${i.missedMeal ? '，中间还错过了饭点' : ''}。`
-        : '他已经很久没有消息了。',
+        ? `她已经大约 ${i.gapHours} 小时没有消息、也没见到她的动静了${i.missedMeal ? '，中间还错过了饭点' : ''}。`
+        : '她已经很久没有消息了。',
     );
   } else if (i.reason === 'late-night-active') {
-    lines.push('这么晚了，他的手机或电脑还一直有动静，像是还没睡。');
+    lines.push('这么晚了，她的手机或电脑还一直有动静，像是还没睡。');
   } else if (i.reason === 'wake') {
     if (i.gapHours !== null && i.gapHours >= 1) {
-      lines.push(`距离他上次出现已经大约 ${i.gapHours} 小时${i.missedMeal ? '，中间还错过了饭点' : ''}。`);
+      lines.push(`距离她上次出现已经大约 ${i.gapHours} 小时${i.missedMeal ? '，中间还错过了饭点' : ''}。`);
     }
   } else if (i.reason === 'overflow') {
-    lines.push('你这阵子一直惦记着他，想他的念头攒满了。');
+    lines.push('你这阵子一直惦记着她，想她的念头攒满了。');
   }
   if (i.asleep) {
     lines.push(
-      '服务这边的记录显示他可能在睡觉（深夜没有手机动静，或睡眠专注开着），这只是推测，他到底醒着还是睡着，你可以用自己查手机的工具确认。'
-        + '如果他像是睡着了，别发消息吵醒他，除非真的有急事。'
-        + '这段时间是你自己的：可以思考、查资料、联网、用工具做点自己想做的事；想跟他说的话先记下来（有记念头的工具就用它），留到他醒了再说。'
+      '服务这边的记录显示她可能在睡觉（深夜没有手机动静，或睡眠专注开着），这只是推测，她到底醒着还是睡着，你可以用自己查手机的工具确认。'
+        + '如果她像是睡着了，别发消息吵醒她，除非真的有急事。'
+        + '这段时间是你自己的：可以思考、查资料、联网、用工具做点自己想做的事；想跟她说的话先记下来（有记念头的工具就用它），留到她醒了再说。'
         + '不发消息的话，整段输出只写 [[SILENT]]。',
     );
   }
-  if (i.localHour !== null) lines.push(`他那边现在大约是 ${i.localHour} 点。`);
+  if (i.localHour !== null) lines.push(`她那边现在大约是 ${i.localHour} 点。`);
   if (i.openItems.length) lines.push(`你心里还挂着这些事：${i.openItems.join('；')}。`);
   if (i.unanswered > 0) {
-    lines.push(`你之前已经主动找过他 ${i.unanswered} 次，他都还没回。这次语气收着点，别追问，也别重复上次说过的话。`);
+    lines.push(`你之前已经主动找过她 ${i.unanswered} 次，她都还没回。这次语气收着点，别追问，也别重复上次说过的话。`);
+  }
+  if (i.reason === 'wake') {
+    lines.push('如果这次醒来做了点什么（查了什么、想到了什么），用 write_diary 记一两句，她在「醒来记录」里能看到。');
   }
   if (!lines.length) return '';
   if (i.reason === 'wake') {
     return `\n\n【此刻的情况（只供你参考）】\n${lines.map((l) => `- ${l}`).join('\n')}\n这些只是背景，说不说、做不做都由你定；不要提"系统""判断""阈值"这类词，也不要把上面的话原样念出来。`;
   }
-  return `\n\n【这次你为什么想找他（只供你参考）】\n${lines.map((l) => `- ${l}`).join('\n')}\n请自然地把这份心情带进你要说的话里；不要提"系统""判断""阈值"这类词，也不要把上面的话原样念出来。`;
+  return `\n\n【这次你为什么想找她（只供你参考）】\n${lines.map((l) => `- ${l}`).join('\n')}\n请自然地把这份心情带进你要说的话里；不要提"系统""判断""阈值"这类词，也不要把上面的话原样念出来。`;
 };
 
 const NOTE_TTL_MS = 10 * 60_000;
@@ -154,7 +160,7 @@ const rememberNote = (taskId: string, text: string, nowMs: number): void => {
   else if (taskId) notes.delete(taskId);
 };
 
-/** 取走（并清掉）这个任务本次放行时留下的"为什么找他"提示；没有就是空串。拼提示词时接在末尾。 */
+/** 取走（并清掉）这个任务本次放行时留下的"为什么找她"提示；没有就是空串。拼提示词时接在末尾。 */
 export const takeGateNote = (taskId: string): string => {
   const n = notes.get(taskId);
   notes.delete(taskId);
@@ -162,7 +168,7 @@ export const takeGateNote = (taskId: string): string => {
 };
 
 export type GateAction =
-  | { kind: 'pass'; why: string }
+  | { kind: 'pass'; why: string; wakeId?: number | null }
   | { kind: 'defer'; afterMs: number; why: string }
   | { kind: 'skip'; why: string };
 
@@ -172,11 +178,11 @@ export const decideGate = async (opts: {
   occurrenceMs: number;
   nowMs: number;
   lastUserMessageAt: number | null;
-  /** 任务 id，用来把"为什么找他"的提示交给后面拼提示词的地方。 */
+  /** 任务 id，用来把"为什么找她"的提示交给后面拼提示词的地方。 */
   taskId?: string;
   /** 心跳任务：问 /wake（只做睡觉 / 刚聊完 / 深夜这类熔断，说不说由角色自己定）。 */
   isHeartbeat?: boolean;
-  /** 角色已经主动找过他几次、他都没回（让提示词收着点）。 */
+  /** 角色已经主动找过她几次、她都没回（让提示词收着点）。 */
   unansweredSends?: number;
   /** 角色最近一次主动发出去的时刻（没有就不传）。 */
   lastSelfSendAt?: number | null;
@@ -191,7 +197,7 @@ export const decideGate = async (opts: {
     if (!a.ok) return { kind: 'skip', why: 'wake-gate-down' };
     if (!a.yes) return { kind: 'skip', why: `wake-skip:${a.info.reason}` };
     rememberNote(opts.taskId ?? '', buildNote(a.info), opts.nowMs);
-    return { kind: 'pass', why: 'wake' };
+    return { kind: 'pass', why: 'wake', wakeId: a.info.wakeId };
   }
 
   if (opts.isWatch) {
@@ -288,13 +294,13 @@ export const heartbeatInstruction = (): string =>
 
 const HB_SPEAK_BLOCK = [
   '【例行醒来】',
-  '这是一次例行的醒来，不是有什么事非要你开口。先对照上面的【最近对话上下文】、你之前发过的话和他的近况。',
-  '默认是不说。只有真的有想对他说的话才开口，比如：',
-  '- 你惦记着他的某件事（他提过的约定、没聊完的话题、你担心的事），想问问或提一句；',
-  '- 他很久没出现，你确实想他了、想知道他在干嘛；',
-  '- 你有件小事想跟他分享，而且这会儿说不会打扰他。',
-  '拿不准就不说。你上一条主动发的他还没回，就别再发；刚聊完又没有新东西，也别硬找话说。',
-  '想先做点事（看看他的动静、记下惦记的事）就去做；做完没有想说的，同样不说。',
+  '这是一次例行的醒来，不是有什么事非要你开口。先对照上面的【最近对话上下文】、你之前发过的话和她的近况。',
+  '默认是不说。只有真的有想对她说的话才开口，比如：',
+  '- 你惦记着她的某件事（她提过的约定、没聊完的话题、你担心的事），想问问或提一句；',
+  '- 她很久没出现，你确实想她了、想知道她在干嘛；',
+  '- 你有件小事想跟她分享，而且这会儿说不会打扰她。',
+  '拿不准就不说。你上一条主动发的她还没回，就别再发；刚聊完又没有新东西，也别硬找话说。',
+  '想先做点事（看看她的动静、记下惦记的事）就去做；做完没有想说的，同样不说。',
   '决定不说 → 整段输出只写 [[SILENT]] 这一个标记，别的一个字都不要写，也不要解释。',
 ].join('\n');
 
@@ -312,9 +318,46 @@ export const rewriteSpeakBlock = (prompt: string): string => {
 
 const HB_SCRATCH_KEY = '__heartbeat';
 
-/** 放行后在这一次 fire 的 scratch 上做个记号，onLLMOutput 靠它认出"这是心跳那一轮"。 */
-export const flagHeartbeat = (scratch: Record<string, unknown> | undefined): void => {
-  if (scratch) scratch[HB_SCRATCH_KEY] = true;
+const HB_WAKE_ID_KEY = '__hbWakeId';
+const HB_TOOLS_KEY = '__hbTools';
+
+/** 放行后在这一次 fire 的 scratch 上做个记号（并记下这次醒来的编号），onLLMOutput 靠它认出"这是心跳那一轮"。 */
+export const flagHeartbeat = (scratch: Record<string, unknown> | undefined, wakeId?: number | null): void => {
+  if (!scratch) return;
+  scratch[HB_SCRATCH_KEY] = true;
+  if (typeof wakeId === 'number') scratch[HB_WAKE_ID_KEY] = wakeId;
+};
+
+/** 心跳那一轮里，模型这一圈要调的工具名（多圈累加），结束时一起回报。 */
+export const noteHeartbeatTools = (scratch: Record<string, unknown> | undefined, names: string[]): void => {
+  if (!scratch || scratch[HB_SCRATCH_KEY] !== true) return;
+  const prev = Array.isArray(scratch[HB_TOOLS_KEY]) ? (scratch[HB_TOOLS_KEY] as string[]) : [];
+  scratch[HB_TOOLS_KEY] = [...prev, ...names].slice(0, 20);
+};
+
+/** 心跳那一轮结束时把结果回报给 Zeabur（给「醒来记录」看）。失败只吞掉，绝不影响发送。 */
+export const reportHeartbeat = async (
+  scratch: Record<string, unknown> | undefined,
+  result: { outcome: string; reason?: string; text?: string },
+): Promise<void> => {
+  if (!cfg || !scratch || scratch[HB_SCRATCH_KEY] !== true) return;
+  const wakeId = scratch[HB_WAKE_ID_KEY];
+  if (typeof wakeId !== 'number') return;
+  const tools = Array.isArray(scratch[HB_TOOLS_KEY]) ? (scratch[HB_TOOLS_KEY] as string[]) : [];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3_000);
+  try {
+    await fetch(`${cfg.url}/wake/result`, {
+      method: 'POST',
+      headers: { 'X-Token': cfg.token, 'content-type': 'application/json' },
+      body: JSON.stringify({ wakeId, ...result, tools }),
+      signal: ctrl.signal,
+    });
+  } catch {
+    // 回报不到就算了
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const SILENT_RE = /^[\[【(（]\s*沉默\s*[\]】)）][。.!！\s]*$/;
