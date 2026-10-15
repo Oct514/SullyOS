@@ -39,7 +39,8 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有需要提交的改动（补丁已经打过）"
           else
-            git commit -m "feat: 心跳补丁（夹带夜间不再勿扰）"
+            git commit -m "feat: 心跳补丁（醒来记录 + 日记工具 + 称呼）"
+            git pull --rebase origin trigger-gate
             git push origin HEAD:trigger-gate
           fi
 
@@ -66,8 +67,12 @@ jobs:
             echo "bundle 里没有「默认不说」的补丁 2。"
             exit 1
           }
-          grep -q "别发消息吵醒他" worker/amsg/worker.bundle.js || {
+          grep -q "别发消息吵醒" worker/amsg/worker.bundle.js || {
             echo "bundle 里没有「夜间不再勿扰」的补丁 3。"
+            exit 1
+          }
+          grep -q "reportHeartbeat\|wake/result" worker/amsg/worker.bundle.js || {
+            echo "bundle 里没有「醒来记录」的补丁 5。"
             exit 1
           }
           grep -q "watch-window-over" worker/amsg/worker.bundle.js || {
