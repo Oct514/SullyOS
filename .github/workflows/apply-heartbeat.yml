@@ -4,7 +4,6 @@ name: Apply heartbeat patch and build bundle
 # worker/amsg/src/index.ts、triggerGate.ts 和 trigger-service/server.js 上，提交回分支，
 # 然后构建带心跳的 worker.bundle.js，在本次运行页面底部 Artifacts 下载。
 # 每个补丁都可重复运行：已经打过就跳过。以后新增补丁只需加一个 apply_heartbeatN.py。
-# （Actions 重新启用后手动触发过一次，补跑被跳过的补丁 5。）
 on:
   push:
     branches: [trigger-gate]
@@ -59,26 +58,13 @@ jobs:
 
       - name: Check the patches are inside the bundle
         run: |
-          grep -q "amsg:heartbeat" worker/amsg/worker.bundle.js || {
-            echo "bundle 里没有心跳代码，补丁可能没打上。"
-            exit 1
-          }
-          grep -q "例行醒来" worker/amsg/worker.bundle.js || {
-            echo "bundle 里没有「默认不说」的补丁 2。"
-            exit 1
-          }
-          grep -q "别发消息吵醒" worker/amsg/worker.bundle.js || {
-            echo "bundle 里没有「夜间不再勿扰」的补丁 3。"
-            exit 1
-          }
-          grep -q "reportHeartbeat\|wake/result" worker/amsg/worker.bundle.js || {
-            echo "bundle 里没有「醒来记录」的补丁 5。"
-            exit 1
-          }
-          grep -q "watch-window-over" worker/amsg/worker.bundle.js || {
-            echo "bundle 里没有触发闸代码。"
-            exit 1
-          }
+          # 打包工具会把中文转成 \uXXXX 编码，所以这里只搜英文标记（字符串字面量 / 属性名不会被改写）。
+          for m in "amsg:heartbeat" "watch-window-over" "lastSelfSendAt" "asleep" "wake/result"; do
+            grep -q "$m" worker/amsg/worker.bundle.js || {
+              echo "bundle 里没有标记 $m，对应的补丁可能没打上。"
+              exit 1
+            }
+          done
 
       - uses: actions/upload-artifact@v4
         with:
