@@ -46,6 +46,7 @@ type GateInfo = {
   missedMeal: boolean;
   asleep: boolean;
   wakeId: number | null;
+  why: string | null;
   openItems: string[];
 };
 type Answer = { ok: true; yes: boolean; info: GateInfo } | { ok: false };
@@ -83,6 +84,7 @@ const ask = async (
         localHour?: unknown;
         missedMeal?: unknown;
         asleep?: unknown;
+        why?: unknown;
         openItems?: unknown;
       } | null;
     };
@@ -98,6 +100,7 @@ const ask = async (
         missedMeal: c.missedMeal === true,
         asleep: c.asleep === true,
         wakeId: typeof j.id === 'number' ? j.id : null,
+        why: typeof c.why === 'string' ? c.why : null,
         openItems: Array.isArray(c.openItems)
           ? c.openItems.filter((x): x is string => typeof x === 'string').slice(0, 5)
           : [],
@@ -122,6 +125,11 @@ const buildNote = (i: GateInfo): string => {
   } else if (i.reason === 'late-night-active') {
     lines.push('这么晚了，她的手机或电脑还一直有动静，像是还没睡。');
   } else if (i.reason === 'wake') {
+    if (i.why === 'miss') lines.push('你这阵子一直惦记着她，想她的念头攒满了。');
+    if (i.why === 'thought') lines.push('你之前记下的事，该跟进一下了。');
+    if (i.why === 'random') {
+      lines.push('没有特别的原因，只是例行醒来：你可以随意逛逛、看看她的动静，或者做点自己想做的事。');
+    }
     if (i.gapHours !== null && i.gapHours >= 1) {
       lines.push(`距离她上次出现已经大约 ${i.gapHours} 小时${i.missedMeal ? '，中间还错过了饭点' : ''}。`);
     }

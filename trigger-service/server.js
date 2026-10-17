@@ -31,7 +31,13 @@ const CFG = {
   maxAiItems: +(env.MAX_AI_ITEMS || 8),         // TA 自己最多同时记几条
   wakeMinGapMin: +(env.WAKE_MIN_GAP_MIN || 20), // 两次醒来至少隔多久（防起点任务和链撞在同一格）
   maxWakesPerDay: +(env.MAX_WAKES_PER_DAY || 40), // 一天最多醒几次（每次醒来都可能调一次模型）
-  afterCharQuietH: +(env.AFTER_CHAR_QUIET_H || 6), // TA 主动说了最后一句、你没回：这么多小时内不再醒
+  afterCharQuietH: +(env.AFTER_CHAR_QUIET_H ?? 0), // TA 主动说了最后一句、你没回：这么多小时内不再醒；0 = 不限制（默认，由 TA 自己决定要不要接着说）
+  wakeReasonCoolH: +(env.WAKE_REASON_COOL_H ?? 3), // 同一个理由，至少隔多久才再醒（TA 发了你没回时再乘 1+次数）
+  thoughtDueMin: +(env.THOUGHT_DUE_MIN ?? 90),     // 念头记下多久后，醒来跟进一次
+  randomProb: +(env.RANDOM_WAKE_PROB ?? 0.08),     // 白天每次检查，随机醒一次的概率（没有别的理由时，偶尔让 TA 自己去逛逛）
+  maxRandomPerDay: +(env.MAX_RANDOM_WAKES_PER_DAY ?? 3),
+  nightProb: +(env.NIGHT_WAKE_PROB ?? 0.1),        // 她睡着时，随机醒来做自己的事的概率
+  maxNightWakes: +(env.MAX_NIGHT_WAKES ?? 3),      // 每天最多几次"睡着时醒来"
 };
 
 const FILE = path.join(env.DATA_DIR || './data', 'state.json');
@@ -138,31 +144,54 @@ export function decide(now, commit) {
 }
 
 // 早安等普通任务用：只看"在睡觉 / 刚聊完"，不记账、不管失联和心绪。
-// 心跳醒来用：只做熔断（刚聊完 / 睡觉 / 深夜没动静 / 醒得太密 / 当天醒太多次），说不说由角色自己定。
+// 心跳醒来用：先过刹车，再用规则判断"有没有理由醒"。全程不调模型；有理由才放行，放行后模型才被调用（角色仍可 [[SILENT]]）。
+// 理由：她很久没出现 / 想她的值攒满 / 记下的念头该跟进 / 偶尔随机醒一次；她睡着时只留"随机醒来做自己的事"。
 export function wake(now, commit, unanswered, lastSelfSendAt) {
   const t = local(now);
   const items = liveItems(now);
   const act = (arr, min) => arr.filter((x) => now - x < min * MIN).length;
   const no = (reason) => ({ wake: false, reason });
-  // 你说了最后一句：只留"正聊着"那一小段静默，之后允许醒（不再有 30 分钟冷却）。
-  if (S.lastChat && (now - S.lastChat) / MIN < CFG.chatActiveMin) return no('fuse:in-chat');
-  // TA 主动说了最后一句、你还没回：不再醒（时间不明也按不醒算）。
   const un = Number.isFinite(unanswered) ? unanswered : S.unanswered;
-  // 睡着 / 深夜没动静：不再拦着不醒——这是角色自己的时间（思考、调工具、联网），只提醒它别发消息吵醒你。
   const asleep = (S.sleeping && now - S.sleepAt < 12 * HOUR)
     || (inWin(t.min, CFG.nightStart, CFG.nightEnd) && act(S.phoneActs, 20) + act(S.pcActs, 20) === 0);
-  // 睡着时醒来不是为了发消息，所以不受上面"TA 主动说了最后一句"的限制。
-  if (!asleep && un >= 1 && (!Number.isFinite(lastSelfSendAt) || now - lastSelfSendAt < CFG.afterCharQuietH * HOUR)) return no('fuse:char-last');
+  // ── 刹车 ──
+  if (S.lastChat && (now - S.lastChat) / MIN < CFG.chatActiveMin) return no('fuse:in-chat');
+  if (CFG.afterCharQuietH > 0 && !asleep && un >= 1 && (!Number.isFinite(lastSelfSendAt) || now - lastSelfSendAt < CFG.afterCharQuietH * HOUR)) return no('fuse:char-last');
   if (S.lastWake && (now - S.lastWake) / MIN < CFG.wakeMinGapMin) return no('fuse:wake-gap');
-  const wakes = S.wakes?.day === t.day ? S.wakes.n : 0;
-  if (wakes >= CFG.maxWakesPerDay) return no('fuse:wake-daily-cap');
+  const wd = S.wakeDay?.day === t.day ? S.wakeDay : { day: t.day, wakes: 0, rand: 0, night: 0 };
+  if (wd.wakes >= CFG.maxWakesPerDay) return no('fuse:wake-daily-cap');
+  // ── 有没有理由醒（规则，不调模型） ──
+  const dtH = Math.min(Math.max((now - S.missAt) / HOUR, 0), 6);
+  const miss = S.miss + CFG.missRate * dtH;                     // 想她的值：随时间涨，她一开口就清零
+  const thr = S.threshold * (1 + un);                           // TA 发了她没回，门槛翻倍
   const seen = Math.max(S.lastChat, S.lastAct);
   const gapMin = seen ? (now - seen) / MIN : 0;
   const mealBetween = seen && (gapMin >= 1440 || CFG.meals.some((m) => (m - local(seen).min + 1440) % 1440 < gapMin));
-  if (commit) { S.lastWake = now; S.wakes = { day: t.day, n: wakes + 1 }; save(); }
+  const cool = CFG.wakeReasonCoolH * (1 + un) * HOUR;           // 同一个理由的冷却
+  const ready = (r) => !(S.wakeBy?.[r] && now - S.wakeBy[r] < cool);
+  const due = items.filter((i) => !i.followedAt && now - (i.at ?? now) >= CFG.thoughtDueMin * MIN);
+  let why = null;
+  if (asleep) {
+    if (wd.night < CFG.maxNightWakes && Math.random() < CFG.nightProb) why = 'random';
+  } else if (seen && ((gapMin / 60 >= CFG.gapMealH && mealBetween) || gapMin / 60 >= CFG.gapMaxH) && ready('long-silence')) why = 'long-silence';
+  else if (miss + items.reduce((a, i) => a + i.weight, 0) >= thr && ready('miss')) why = 'miss';
+  else if (due.length && ready('thought')) why = 'thought';
+  else if (wd.rand < CFG.maxRandomPerDay && Math.random() < CFG.randomProb) why = 'random';
+  if (commit) {
+    S.miss = miss; S.missAt = now;
+    if (why) {
+      S.lastWake = now;
+      S.wakeBy = { ...(S.wakeBy ?? {}), [why]: now };
+      S.wakeDay = { ...wd, wakes: wd.wakes + 1, rand: wd.rand + (why === 'random' && !asleep ? 1 : 0), night: wd.night + (why === 'random' && asleep ? 1 : 0) };
+      if (why === 'miss') { S.miss = 0; S.threshold = CFG.threshold * (1 + CFG.jitter * (Math.random() * 2 - 1)); }
+      if (why === 'thought') for (const i of due) i.followedAt = now;
+      save();
+    }
+  }
+  if (!why) return no('idle');
   return {
     wake: true, reason: 'wake', unanswered: un,
-    context: { gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, asleep, openItems: items.map((i) => i.text) },
+    context: { why, gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, asleep, openItems: items.map((i) => i.text) },
   };
 }
 
@@ -257,7 +286,7 @@ const server = http.createServer(async (req, res) => {
       const r = wake(now, true, +b.unanswered, b.lastSelfSendAt == null ? NaN : +b.lastSelfSendAt);
       const c = r.context ?? {};
       const e = logAdd({
-        kind: 'wake', decision: r.wake ? 'pass' : 'skip', reason: r.reason,
+        kind: 'wake', decision: r.wake ? 'pass' : 'skip', reason: r.wake ? (c.why ?? r.reason) : r.reason,
         ...(r.wake ? { asleep: !!c.asleep, gapHours: c.gapHours, localHour: c.localHour } : {}),
       });
       save();
