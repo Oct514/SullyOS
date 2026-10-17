@@ -29,6 +29,9 @@ const positiveMessageId = (value: unknown): number | undefined =>
         ? Math.floor(value)
         : undefined;
 
+/** 工具调用胶囊只给人看（见 utils/toolCallCards.ts），不进 AI 上下文。 */
+const isToolCardMessage = (message: Message): boolean => !!message.metadata?.toolCard;
+
 export const clampManualContextLimit = (value: unknown): number => {
     const parsed = typeof value === 'number' && Number.isFinite(value)
         ? Math.floor(value)
@@ -161,7 +164,8 @@ export const loadCharacterContextRange = async (
             clampManualContextLimit(char.contextLimit),
             true,
         );
-    return computeContextRangeSnapshot(sourceMessages, char, hwm);
+    const snapshot = computeContextRangeSnapshot(sourceMessages, char, hwm);
+    return { ...snapshot, messages: snapshot.messages.filter(message => !isToolCardMessage(message)) };
 };
 
 export const countMessagesFrom = (messages: Message[], messageId: number): number =>
@@ -195,4 +199,4 @@ export const loadCharacterContextMessageIds = async (char: CharacterProfile, can
 export const selectCharacterContextMessages = (messages: Message[], char: CharacterProfile, hwm = getMemoryPalaceHighWaterMarkForContext(char.id)): Message[] =>
     computeContextRangeSnapshot(messages, (char.contextRangePolicyVersion || 0) >= 1 ? char : {
         ...char, contextUserStartMessageId: char.contextUserStartMessageId ?? char.hideBeforeMessageId,
-    }, hwm).messages;
+    }, hwm).messages.filter(message => !isToolCardMessage(message));
