@@ -28,6 +28,7 @@ import {
     type McpTransportTarget,
 } from './mcpFireCore';
 import { isWorkerReachableUrl } from './amsgToolPack';
+import { recordToolCallCard } from './toolCallCards';
 
 export { MCP_REQUEST_TIMEOUT_MS, normalizeMcpToolArguments };
 export type { McpToolResult };
@@ -285,13 +286,13 @@ export const discoverMcpTools = async (
 };
 
 /**
- * 调用一个工具（会自动补握手；session 失效自动重试一次）。
+ * 真正发起一次工具调用（会自动补握手；session 失效自动重试一次）。
  * 重试前的会话重置是 core 就地做的，改的就是这张表里的那个对象，两边不会走岔。
  */
-export const callMcpTool = async (
+const callMcpToolRaw = async (
     server: McpServerConfig,
     toolName: string,
-    args: Record<string, any> = {},
+    args: Record<string, any>,
     signal?: AbortSignal,
 ): Promise<McpToolResult> => {
     const tool = (server.tools || []).find(item => item.name === toolName);
@@ -311,6 +312,28 @@ export const callMcpTool = async (
         inputSchema: (server.tools || []).find(tool => tool.name === toolName)?.inputSchema,
         serverLabel: server.name,
     });
+};
+
+/**
+ * 调用一个工具。若这次调用来自单聊的某一轮回复（signal 由 createReplyRun 创建），
+ * 调用结束后在聊天里落一张「✓ 执行成功 / ✗ 执行失败」的灰色胶囊，见 utils/toolCallCards.ts。
+ */
+export const callMcpTool = async (
+    server: McpServerConfig,
+    toolName: string,
+    args: Record<string, any> = {},
+    signal?: AbortSignal,
+): Promise<McpToolResult> => {
+    let result: McpToolResult;
+    try {
+        result = await callMcpToolRaw(server, toolName, args, signal);
+    } catch (e: any) {
+        // 用户点了停止就不记；其余异常记一张失败卡后原样抛出，调用方行为不变
+        if (!signal?.aborted) await recordToolCallCard(signal, toolName, false, e?.message || String(e));
+        throw e;
+    }
+    await recordToolCallCard(signal, toolName, !!result.success, result.success ? undefined : (result as any).error);
+    return result;
 };
 
 /** 测试连接: 验证握手 + tools/list 能通，返回工具清单供持久化 */
