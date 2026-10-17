@@ -2,6 +2,8 @@ import { DB } from './db';
 
 const STOPPED_KEY = 'chat_stopped_reply_uuids_v1';
 const runs = new Set<ReplyRun>();
+// 工具调用卡片用：通过请求的 AbortSignal 找回是哪一轮回复（见 utils/toolCallCards.ts）
+const runsBySignal = new WeakMap<AbortSignal, ReplyRun>();
 type Display = { ids: Set<number>; previews: string[] };
 const displays = new Map<string, Display>();
 const stoppedInMemory = new Set<string>();
@@ -103,8 +105,14 @@ export class ReplyRun {
 export function createReplyRun(charId: string, uuid?: string): ReplyRun {
     const run = new ReplyRun(charId, uuid);
     runs.add(run);
+    runsBySignal.set(run.signal, run);
     if (isReplyStopped(uuid)) run.stop();
     return run;
+}
+
+/** 请求用的 AbortSignal → 这一轮回复；不是 createReplyRun 创建的 signal 返回 undefined。 */
+export function getReplyRunBySignal(signal?: AbortSignal | null): ReplyRun | undefined {
+    return signal ? runsBySignal.get(signal) : undefined;
 }
 
 export function withReplyCancellation<T>(run: ReplyRun | undefined, operation: () => Promise<T>): Promise<T> {
