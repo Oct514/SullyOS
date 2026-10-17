@@ -15,7 +15,8 @@ export const isVisibleChatMessage = (message: Message, hideSystemLogs = false): 
     && message.metadata?.source !== 'call'
     && message.metadata?.source !== 'story_theater_memory'
     && !message.metadata?.proactiveHint
-    && !(hideSystemLogs && message.role === 'system' && message.type !== 'score_card')
+    // 工具调用卡片是用户想看的步骤，不算「系统日志」，开了隐藏也照常显示
+    && !(hideSystemLogs && message.role === 'system' && message.type !== 'score_card' && !message.metadata?.toolCard)
 );
 
 /** 点击后进入私聊的桌面消息卡，与聊天页共用来源过滤，不展示系统日志。 */
