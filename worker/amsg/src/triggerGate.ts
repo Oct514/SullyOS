@@ -47,6 +47,7 @@ type GateInfo = {
   asleep: boolean;
   wakeId: number | null;
   why: string | null;
+  awayHours: number | null;
   openItems: string[];
 };
 type Answer = { ok: true; yes: boolean; info: GateInfo } | { ok: false };
@@ -85,6 +86,7 @@ const ask = async (
         missedMeal?: unknown;
         asleep?: unknown;
         why?: unknown;
+        awayHours?: unknown;
         openItems?: unknown;
       } | null;
     };
@@ -101,6 +103,7 @@ const ask = async (
         asleep: c.asleep === true,
         wakeId: typeof j.id === 'number' ? j.id : null,
         why: typeof c.why === 'string' ? c.why : null,
+        awayHours: typeof c.awayHours === 'number' ? c.awayHours : null,
         openItems: Array.isArray(c.openItems)
           ? c.openItems.filter((x): x is string => typeof x === 'string').slice(0, 5)
           : [],
@@ -127,6 +130,12 @@ const buildNote = (i: GateInfo): string => {
   } else if (i.reason === 'wake') {
     if (i.why === 'miss') lines.push('你这阵子一直惦记着她，想她的念头攒满了。');
     if (i.why === 'thought') lines.push('你之前记下的事，该跟进一下了。');
+    if (i.why === 'back') {
+      lines.push(
+        `她刚回来了（睡醒了，或者隔了${i.awayHours !== null ? `大约 ${i.awayHours} 小时` : '好一阵'}第一次用手机）：`
+          + '想打个招呼、问问她睡得怎么样，或者提一句你自己做过的事，都可以；觉得不合适就不说。',
+      );
+    }
     if (i.why === 'random') {
       lines.push('没有特别的原因，只是例行醒来：你可以随意逛逛、看看她的动静，或者做点自己想做的事。');
     }

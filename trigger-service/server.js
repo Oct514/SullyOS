@@ -38,6 +38,7 @@ const CFG = {
   maxRandomPerDay: +(env.MAX_RANDOM_WAKES_PER_DAY ?? 3),
   nightProb: +(env.NIGHT_WAKE_PROB ?? 0.1),        // 她睡着时，随机醒来做自己的事的概率
   maxNightWakes: +(env.MAX_NIGHT_WAKES ?? 3),      // 每天最多几次"睡着时醒来"
+  backGapH: +(env.BACK_GAP_H ?? 3),                // 她隔了这么多小时没动静，再有动静就算"她回来了"
 };
 
 const FILE = path.join(env.DATA_DIR || './data', 'state.json');
@@ -163,17 +164,20 @@ export function wake(now, commit, unanswered, lastSelfSendAt) {
   // ── 有没有理由醒（规则，不调模型） ──
   const dtH = Math.min(Math.max((now - S.missAt) / HOUR, 0), 6);
   const miss = S.miss + CFG.missRate * dtH;                     // 想她的值：随时间涨，她一开口就清零
-  const thr = S.threshold * (1 + un);                           // TA 发了她没回，门槛翻倍
+  const thr = S.threshold * (1 + 0.5 * Math.min(un, 3));                           // TA 发了她没回：门槛温和加码（每次 +50%，最多 3 次）
   const seen = Math.max(S.lastChat, S.lastAct);
   const gapMin = seen ? (now - seen) / MIN : 0;
   const mealBetween = seen && (gapMin >= 1440 || CFG.meals.some((m) => (m - local(seen).min + 1440) % 1440 < gapMin));
-  const cool = CFG.wakeReasonCoolH * (1 + un) * HOUR;           // 同一个理由的冷却
+  const cool = CFG.wakeReasonCoolH * (1 + 0.5 * Math.min(un, 3)) * HOUR;           // 同一个理由的冷却
   const ready = (r) => !(S.wakeBy?.[r] && now - S.wakeBy[r] < cool);
   const due = items.filter((i) => !i.followedAt && now - (i.at ?? now) >= CFG.thoughtDueMin * MIN);
+  // 她回来了（睡醒 / 隔了很久第一次有动静）：1 小时内醒一次，每次回来只算一次；她已经在跟 TA 聊了就不必了。
+  const backReady = !!S.backAt && now - S.backAt < 60 * MIN && S.lastChat < S.backAt && !(S.wakeBy?.back >= S.backAt);
   let why = null;
   if (asleep) {
     if (wd.night < CFG.maxNightWakes && Math.random() < CFG.nightProb) why = 'random';
-  } else if (seen && ((gapMin / 60 >= CFG.gapMealH && mealBetween) || gapMin / 60 >= CFG.gapMaxH) && ready('long-silence')) why = 'long-silence';
+  } else if (backReady) why = 'back';
+  else if (seen && ((gapMin / 60 >= CFG.gapMealH && mealBetween) || gapMin / 60 >= CFG.gapMaxH) && ready('long-silence')) why = 'long-silence';
   else if (miss + items.reduce((a, i) => a + i.weight, 0) >= thr && ready('miss')) why = 'miss';
   else if (due.length && ready('thought')) why = 'thought';
   else if (wd.rand < CFG.maxRandomPerDay && Math.random() < CFG.randomProb) why = 'random';
@@ -191,7 +195,10 @@ export function wake(now, commit, unanswered, lastSelfSendAt) {
   if (!why) return no('idle');
   return {
     wake: true, reason: 'wake', unanswered: un,
-    context: { why, gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, asleep, openItems: items.map((i) => i.text) },
+    context: {
+      why, gapHours: +(gapMin / 60).toFixed(1), localHour: t.hour, missedMeal: !!mealBetween, asleep,
+      awayHours: why === 'back' ? (S.backAway ?? null) : null, openItems: items.map((i) => i.text),
+    },
   };
 }
 
@@ -203,6 +210,15 @@ export function allow(now) {
 
 function event(type, q, now) {
   const prune = (a) => a.filter((x) => now - x < 3 * HOUR).slice(-300);
+  // 她回来了：隔了很久第一次有动静（手机/电脑），或者关了睡眠专注 → 记一下，wake() 会给 TA 一次醒来的机会。
+  if (type === 'phone' || (type === 'pc' && +(q.get('idle') ?? 0) < 180)) {
+    if (S.sleeping && now - S.sleepAt > 30 * MIN) {   // 睡眠标记忘了关：有动静就当她醒了
+      S.backAway = +(((now - (S.lastAct || S.sleepAt)) / HOUR)).toFixed(1); S.sleeping = false; S.backAt = now;
+    } else if (S.lastAct && now - S.lastAct >= CFG.backGapH * HOUR) {
+      S.backAway = +(((now - S.lastAct) / HOUR)).toFixed(1); S.backAt = now;
+    }
+  }
+  if (type === 'sleep_off') { S.backAway = +(((now - (S.lastAct || S.sleepAt || now)) / HOUR)).toFixed(1); S.backAt = now; }
   if (type === 'chat') { S.lastChat = now; S.lastAct = now; S.unanswered = 0; S.miss = 0; S.missAt = now; }
   else if (type === 'phone') { S.phoneActs = prune([...S.phoneActs, now]); S.lastAct = now; }
   else if (type === 'pc') {
