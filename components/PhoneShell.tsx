@@ -63,6 +63,7 @@ const VRWorldApp = lazyApp(() => import('../apps/VRWorldApp'));
 const WorldHomeApp = lazyApp(() => import('../apps/WorldHomeApp'));
 const CharCreatorDevApp = lazyApp(() => import('../apps/CharCreatorDevApp'));
 const ImageGenApp = lazyApp(() => import('../apps/ImageGenApp'));
+const WakeLogApp = lazyApp(() => import('../apps/WakeLogApp'));
 const SpecialMomentsApp = lazyApp(() => import('./ValentineEvent').then(m => ({ default: m.SpecialMomentsApp })));
 
 // 仅供「桌面稳定后的空闲串行预热」。严格 await 前一个再取下一个，且任何用户操作都会停止队列。
@@ -97,6 +98,7 @@ const APP_BY_ID: Partial<Record<AppID, PreloadableLazy>> = {
   [AppID.VRWorld]: VRWorldApp, [AppID.CharCreatorDev]: CharCreatorDevApp, [AppID.SpecialMoments]: SpecialMomentsApp,
   [AppID.WorldHome]: WorldHomeApp,
   [IMAGEGEN_APP_ID]: ImageGenApp,
+  [WAKELOG_APP_ID]: WakeLogApp,
 };
 // AppIcon 的 pointerdown 只预取用户正在点的 App；失败时由 preloadableLazy 清缓存，点击可正常重试。
 setAppPayloadWarmer((id: AppID) => APP_BY_ID[id]?.preload());
@@ -111,6 +113,7 @@ import { formatBytes } from '../utils/format';
 import { trackEvent } from '../utils/analytics';
 import { AppID } from '../types';
 import { IMAGEGEN_APP_ID } from '../utils/imageGenAppId';
+import { WAKELOG_APP_ID } from '../utils/wakeLogAppId';
 import { shellHandlesSafeArea } from '../utils/safeAreaApps';
 import { App as CapApp } from '@capacitor/app';
 import { StatusBar as CapStatusBar, Style as StatusBarStyle } from '@capacitor/status-bar';
@@ -974,6 +977,7 @@ const PhoneShell: React.FC = () => {
       case AppID.WorldHome: return <WorldHomeApp />;
       case AppID.CharCreatorDev: return <CharCreatorDevApp />;
       case IMAGEGEN_APP_ID: return <ImageGenApp />;
+      case WAKELOG_APP_ID: return <WakeLogApp />;
       case AppID.Launcher:
       default: return <Launcher />;
     }
