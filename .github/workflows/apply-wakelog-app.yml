@@ -1,0 +1,63 @@
+name: Register WakeLog app (wakelog-app)
+
+# 在 wakelog-app 分支上自动完成"登记"（constants.tsx 与 components/PhoneShell.tsx 各加几行），提交回分支，
+# 然后只对用到的文件做一次类型检查。合并到 master 之前，这个 workflow 和脚本会被删掉，不会进入主分支。
+on:
+  push:
+    branches: [wakelog-app]
+    paths:
+      - '.github/scripts/apply_wakelog_app.py'
+      - '.github/workflows/apply-wakelog-app.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: wakelog-app
+
+      - name: Register the app
+        run: python3 .github/scripts/apply_wakelog_app.py
+
+      - name: Commit registered files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add constants.tsx components/PhoneShell.tsx
+          if git diff --cached --quiet; then
+            echo "没有需要提交的改动（已经登记过）"
+          else
+            git commit -m "feat: 醒来记录 App 登记（桌面图标 + 页面渲染）"
+            git pull --rebase origin wakelog-app
+            git push origin HEAD:wakelog-app
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type-check only the files this change touches
+        run: |
+          cat > tsconfig.wakelog.json <<'EOF'
+          { "extends": "./tsconfig.json", "include": ["apps/WakeLogApp.tsx", "utils/wakeLogAppId.ts", "constants.tsx", "components/PhoneShell.tsx", "**/*.d.ts"] }
+          EOF
+          pnpm exec tsc -p tsconfig.wakelog.json > /tmp/tsc.out 2>&1 || true
+          mine=$(grep -E '^(apps/WakeLogApp\.tsx|utils/wakeLogAppId\.ts|constants\.tsx|components/PhoneShell\.tsx)' /tmp/tsc.out || true)
+          if [ -n "$mine" ]; then
+            echo "$mine"
+            echo "新增的 App 有类型错误，见上面。"
+            exit 1
+          fi
+          echo "新增的 App 没有类型错误（别处原有的告警不算）。tsc 共输出 $(wc -l < /tmp/tsc.out) 行。"
